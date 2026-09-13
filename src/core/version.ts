@@ -17,10 +17,15 @@ export const HUNCH_VERSION: string = (() => {
   }
 })();
 
+/** The single source of truth for Hunch's published package identity — every
+ *  other module that needs the name (update checks, MCP/provider configs)
+ *  derives from this instead of repeating the string literal. */
+export const HUNCH_PACKAGE_NAME = "@davesheffer/hunch";
+
 /** Exact public npm package consumed by generated CI and shared MCP/provider
  * configs. A floating package name would let one committed configuration run
  * different Hunch semantics as npm's latest release changes. */
-export const HUNCH_PACKAGE_SPEC = `@davesheffer/hunch@${HUNCH_VERSION}`;
+export const HUNCH_PACKAGE_SPEC = `${HUNCH_PACKAGE_NAME}@${HUNCH_VERSION}`;
 
 /** npm alias used by npx launchers. Giving the fetched package a distinct local
  * alias prevents npm exec from treating this repository (which has the same
