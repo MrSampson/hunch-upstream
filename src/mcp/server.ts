@@ -18,7 +18,7 @@ import { captureState, captureBatchState } from "../store/stateCapture.js";
 import { CaptureRequestSchema, CaptureBatchRequestSchema, CaptureBatchResultSchema, STATE_CAPTURE_VERSION, STATE_CAPTURE_BATCH_VERSION } from "../core/stateContract.js";
 import { ReadRequestSchema, ReadResponseSchema, WriteRequestSchema, WriteResultSchema, SubscribeRequestSchema, RecordsRequestSchema, RecordsResponseSchema, STATE_READ_VERSION, STATE_WRITE_VERSION, STATE_SUBSCRIBE_VERSION, STATE_RECORDS_VERSION, stateHash } from "../core/stateContract.js";
 import { selectEmbedder } from "../store/embedder.js";
-import { decisionId, findingId } from "../core/ids.js";
+import { decisionId, findingId, manualDecisionId } from "../core/ids.js";
 import { buildCorrectionConstraint } from "../core/correction.js";
 import { knownRepoDeps } from "../synthesis/tripwires.js";
 import { refreshExistingGrounding } from "../integrations/providers.js";
@@ -1993,7 +1993,16 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
         // unverified string that could collide with (or orphan) a real commit id.
         const resolved = decision.commit ? revParse(decision.commit, root) : null;
         const fullSha = resolved && /^[0-9a-f]{40}$/.test(resolved) ? resolved : null;
-        const id = fullSha ? decisionId(fullSha) : decisionId(`manual:${decision.title}`);
+        // The manual fallback used to seed on the title ALONE — so two genuinely
+        // different decisions with the same title, captured with no commit on two
+        // DIFFERENT branches (e.g. a misrouted call that landed on the primary
+        // checkout's branch and a corrected re-call on the calling worktree's own
+        // branch), collided on one id and silently overwrote each other, or lost
+        // one side at a later git merge (issue #54). manualDecisionId folds the
+        // resolved root's current branch into the seed instead (see its doc
+        // comment in core/ids.ts for why that closes the collision without
+        // breaking the intended same-branch draft-upgrade path).
+        const id = fullSha ? decisionId(fullSha) : manualDecisionId(root, decision.title);
 
         // Preserve the ADR lineage from the SAME home this write will use. A private
         // re-record must retain its own optional fields, but must never inherit a

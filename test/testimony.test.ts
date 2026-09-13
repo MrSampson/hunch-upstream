@@ -169,10 +169,13 @@ test("an un-token'd re-record INHERITS an existing human signature — testimony
 test("agent testimony does NOT lock the id slot against a later human capture", async () => {
   const s = await setup();
   try {
-    // The id is seeded by "manual:<title>" when no resolvable commit is given, so the
-    // SAME TITLE is what collides on one slot; a different TOPIC is what makes it a
-    // different identity. (Passing a short sha into a non-git fixture yields no
-    // fullSha, so commit-keyed ids would silently NOT collide — a vacuous test.)
+    // The id is seeded by "manual:<branch-or-root>:<title>" when no resolvable commit
+    // is given (issue #54); this fixture's root isn't a git repo at all, so the branch
+    // component is stably absent and the root path itself stays constant across both
+    // calls below — leaving the SAME TITLE as what collides on one slot, and a
+    // different TOPIC as what makes it a different identity. (Passing a short sha into
+    // a non-git fixture yields no fullSha, so commit-keyed ids would silently NOT
+    // collide — a vacuous test.)
     await s.call("hunch_record_decision", {
       decision: { title: "How caching works", decision: "Testimony.", topic: "cache.policy" },
     });

@@ -3,6 +3,7 @@
  *  git diff of `.hunch/` stays minimal. Decisions/bugs use a content hash too,
  *  so the learning loop is idempotent for the same commit. */
 import { createHash } from "node:crypto";
+import { currentBranch } from "../extractors/git.js";
 
 export function shortHash(input: string, len = 10): string {
   return createHash("sha1").update(input).digest("hex").slice(0, len);
@@ -48,9 +49,21 @@ export function resourceRelationshipId(from: string, to: string, type: string): 
 
 /** Decision id. Seed with the CANONICAL full commit sha (the auto-sync and MCP
  *  commit paths both do this, so a recorded decision upgrades the auto-draft for
- *  the same commit), or with "manual:<title>" for an ad-hoc MCP decision. */
+ *  the same commit), or via manualDecisionId for an ad-hoc MCP decision with no
+ *  commit. */
 export function decisionId(seed: string): string {
   return "dec_" + shortHash(seed);
+}
+
+/** Manual (no-commit) decision id, scoped to the CALLING checkout's current
+ *  branch so two same-titled captures on two different branches can't collide
+ *  (issue #54): "manual:<branch-or-root>:<title>". Git refuses to check out the
+ *  same branch in two worktrees at once, so same-branch re-record still lands
+ *  on the same id (the intended draft-upgrade workflow) while cross-branch
+ *  captures with the same title now mint different ids. `root` stands in for
+ *  the branch in detached HEAD, where there is no branch name to key on. */
+export function manualDecisionId(root: string, title: string): string {
+  return decisionId(`manual:${currentBranch(root) || root}:${title}`);
 }
 
 /** Bug id seeded by symptom/test so the same failure doesn't spawn duplicates. */

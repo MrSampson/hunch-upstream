@@ -9,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { HunchStore } from "../src/store/hunchStore.js";
-import { constraintId, decisionId, findingId } from "../src/core/ids.js";
+import { constraintId, decisionId, findingId, manualDecisionId } from "../src/core/ids.js";
 import { resolveActiveRoot } from "../src/mcp/roots.js";
 import { pathKnownToHistory } from "../src/extractors/git.js";
 import { buildServerWithRootControl, wireClientRoots, misroutedWorktreeCandidates } from "../src/mcp/server.js";
@@ -947,7 +947,7 @@ test("a capture after initialization lands in the advertised worktree, not the s
   }) as { isError?: boolean };
   assert.equal(!!result.isError, false);
 
-  const filename = `${decisionId(`manual:${title}`)}.json`;
+  const filename = `${manualDecisionId(fixture.worktree, title)}.json`;
   assert.equal(existsSync(join(fixture.worktree, ".hunch", "decisions", filename)), true);
   assert.equal(existsSync(join(fixture.root, ".hunch", "decisions", filename)), false);
 });
@@ -1064,7 +1064,7 @@ test("an explicit cwd argument re-homes a capture to the worktree with no roots 
   assert.equal(!!result.isError, false);
   assert.equal(control.getRoot(), fixture.worktree, "the cwd hint re-homes the server for this and later calls");
 
-  const filename = `${decisionId(`manual:${title}`)}.json`;
+  const filename = `${manualDecisionId(fixture.worktree, title)}.json`;
   assert.equal(existsSync(join(fixture.worktree, ".hunch", "decisions", filename)), true);
   assert.equal(existsSync(join(fixture.root, ".hunch", "decisions", filename)), false);
 });
@@ -1231,7 +1231,7 @@ test("a capture whose related_files only exist in a linked worktree is refused w
   assert.ok(text.includes(fixture.worktree), `refusal should name the likely-correct worktree: ${text}`);
   assert.ok(/cwd/.test(text), `refusal should tell the caller to pass cwd: ${text}`);
 
-  const filename = `${decisionId(`manual:${title}`)}.json`;
+  const filename = `${manualDecisionId(fixture.root, title)}.json`;
   assert.equal(existsSync(join(fixture.root, ".hunch", "decisions", filename)), false, "must not land on the primary checkout");
   assert.equal(existsSync(join(fixture.worktree, ".hunch", "decisions", filename)), false, "must not silently guess the worktree either — the caller must retry with cwd");
 });
@@ -1296,7 +1296,7 @@ test("a capture with related_files that don't exist in any worktree still succee
   }) as { isError?: boolean };
   assert.equal(!!result.isError, false, "no plausible alternate worktree means proceed as before");
 
-  const filename = `${decisionId(`manual:${title}`)}.json`;
+  const filename = `${manualDecisionId(fixture.root, "future-file capture")}.json`;
   assert.equal(existsSync(join(fixture.root, ".hunch", "decisions", filename)), true, "must actually land at root, not just avoid erroring");
 });
 
