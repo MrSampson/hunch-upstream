@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { inspectIntegrations, repairIntegrationPins, integrationHealthFails, integrationSessionWarning, HARNESSES, CAPABILITIES } from "../src/integrations/health.js";
 import { probeIntegration } from "../src/integrations/probe.js";
@@ -133,6 +133,29 @@ test("repair preserves comments, foreign servers, foreign hooks and unrelated se
   } finally { f.cleanup(); }
 });
 
+test("a harness whose hooks are committed but whose MCP config simply doesn't exist here yet is untested, not a hard issue — only a MALFORMED/broken mcp config is a real issue (#70)", () => {
+  const f = fixture();
+  try {
+    // Only the hooks half — mirrors a harness whose hooks file is intentionally
+    // committed while its MCP config is gitignored/per-developer and hasn't
+    // been generated on this checkout yet (e.g. a fresh clone, before `hunch
+    // init`/local host setup). This must read as "not configured here", not
+    // as a repository-level misconfiguration.
+    installClaudeHooks(f.root, command());
+    const report = inspectIntegrations(f.root, "claude");
+    assert.equal(report.harnesses[0]!.capabilities.mcp.status, "untested");
+    assert.equal(report.issues.some(i => i.file === ".mcp.json"), false, "a simply-absent mcp config must not be scored as an issue");
+    assert.equal(integrationHealthFails(report), false);
+
+    // Contrast: once the file EXISTS but is broken, that's a genuine issue —
+    // this must keep failing exactly as before.
+    f.write(".mcp.json", "{broken");
+    const broken = inspectIntegrations(f.root, "claude");
+    assert.ok(broken.issues.some(i => i.file === ".mcp.json" && i.code === "mcp-config"));
+    assert.equal(integrationHealthFails(broken), true);
+  } finally { f.cleanup(); }
+});
+
 test("malformed config aborts repair before any good file is changed", () => {
   const f = fixture();
   try {
@@ -189,6 +212,33 @@ test("unknown dependency ranges, conflicting versions, and absent integrations f
     f.write("package.json", { dependencies: { "@davesheffer/hunch": version }, devDependencies: { "@davesheffer/hunch": "1.22.0" } });
     assert.ok(inspectIntegrations(f.root).issues.some(i => i.code === "dependency-version"));
   } finally { f.cleanup(); }
+});
+
+test("this repo's OWN tracked files never leave `hunch doctor` failing on a plain fresh checkout — a harness whose hooks file is committed without its gitignored MCP-config sibling breaks this on every clone, forever, not just some (#70)", () => {
+  const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+  const tracked = execFileSync("git", ["ls-files"], { cwd: repoRoot, encoding: "utf8" }).trim().split("\n").filter(Boolean);
+  const root = mkdtempSync(join(tmpdir(), "hunch-fresh-checkout-"));
+  try {
+    for (const rel of tracked) {
+      const dest = join(root, rel);
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(join(repoRoot, rel), dest);
+    }
+    const report = inspectIntegrations(root);
+    // Mirrors `hunch doctor`'s own gate exactly (src/cli/index.ts): a
+    // harness-less checkout is fine (that's the escape hatch doctor's own
+    // comment describes — "a shared-memory or CLI-only checkout may
+    // intentionally have no local assistant config") — only a DETECTED
+    // harness with a real issue should fail it.
+    const doctorFails = report.harnesses.length > 0 && integrationHealthFails(report);
+    assert.equal(
+      doctorFails,
+      false,
+      `a fresh checkout of this repo's own tracked files must never fail hunch doctor's integration check: ${JSON.stringify(report.issues)}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("repair refuses symlinks and ambiguous foreign copies of the same pin", { skip: process.platform === "win32" }, () => {

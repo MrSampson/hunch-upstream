@@ -130,8 +130,21 @@ export function inspectIntegrations(root: string, selected?: Harness): Integrati
       recordPins(spec.mcp, [launcher.command, ...launcher.args]);
       capabilities.mcp.detail = "Configured locally; use --probe to verify a fresh server, then reconnect the host";
     } catch (e) {
-      report.issues.push({ file: spec.mcp, code: "mcp-config", detail: (e as Error).message });
-      capabilities.mcp.detail = "MCP configuration missing, disabled, invalid, or outside supported inspection format";
+      // A harness can be detected here via ITS HOOKS FILE ALONE (line ~112) —
+      // some hooks files are deliberately committed while their MCP config is
+      // a per-clone, gitignored scaffold (e.g. this repo's own
+      // .windsurf/hooks.json). On a fresh checkout that config simply doesn't
+      // exist yet, which is a "not configured on this machine" state, not a
+      // repository-level misconfiguration — it must stay `untested`
+      // (informational, matching every other not-yet-evidenced capability
+      // here), not a hard `issues` entry that fails `hunch doctor` on every
+      // clone forever (#70). A file that EXISTS but is malformed/disabled/
+      // unreadable in some other way is still a genuine issue.
+      const notConfiguredHere = (e as NodeJS.ErrnoException).code === "ENOENT";
+      if (!notConfiguredHere) report.issues.push({ file: spec.mcp, code: "mcp-config", detail: (e as Error).message });
+      capabilities.mcp.detail = notConfiguredHere
+        ? "Not configured on this machine — hooks are wired, but no local MCP config exists yet; run `hunch init` or set up this host"
+        : "MCP configuration disabled, invalid, or outside supported inspection format";
     }
     let events: Obj = {};
     let disabled = false;
