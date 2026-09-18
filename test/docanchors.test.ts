@@ -84,6 +84,17 @@ test("parseDocAnchors: a CRLF checkout still detects the fence — an example ma
   assert.deepEqual(anchors, [{ topic: "real.topic", pin: "dec_aaaa000001", line: 7 }]);
 });
 
+test("parseDocAnchors: mixed LF and CRLF line endings in the same document still detect the fence", () => {
+  const md =
+    "# How to anchor a doc\r\n\n```markdown\r\n<!-- hunch:topic example.topic dec_ffff000009 -->\n```\r\n\n<!-- hunch:topic real.topic dec_aaaa000001 -->\r\nProse about the real topic.\n";
+  const anchors = parseDocAnchors(md);
+  assert.deepEqual(anchors, [{ topic: "real.topic", pin: "dec_aaaa000001", line: 7 }]);
+});
+
+test("parseDocAnchors: an unclosed fence on CRLF still swallows everything to EOF", () => {
+  assert.deepEqual(parseDocAnchors("```\r\n<!-- hunch:topic dangling.example -->"), []);
+});
+
 test("parseDocAnchors: markers inside inline code spans are examples too", () => {
   const md = [
     "Anchor a section with `<!-- hunch:topic span.example -->` in the doc.",   // inline span → ignored
