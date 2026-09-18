@@ -4,7 +4,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { tempStore, prov } from "./helpers.js";
+import { tempStore, prov, mkSymbol } from "./helpers.js";
 import { openMemoryDb, type DB } from "../src/store/db.js";
 
 const require = createRequire(import.meta.url);
@@ -14,10 +14,10 @@ function seed() {
   const ctx = tempStore();
   const { store } = ctx;
   store.json.replaceAll("symbols", [
-    { id: "sym_a", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 40, churn_90d: 14, bug_count: 3, fan_in: 2, fan_out: 0 }, last_changed: "" },
-    { id: "sym_b", file: "src/billing/charge.ts", name: "charge", kind: "function", signature_hash: "", calls: ["sym_a"], called_by: [], metrics: { loc: 30, churn_90d: 1, bug_count: 0, fan_in: 0, fan_out: 1 }, last_changed: "" },
-    { id: "sym_c", file: "src/api/mw.ts", name: "mw", kind: "function", signature_hash: "", calls: ["sym_a"], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 1 }, last_changed: "" },
-  ] as never);
+    mkSymbol("sym_a", "src/auth/session.ts", "verifySession", { metrics: { loc: 40, churn_90d: 14, bug_count: 3, fan_in: 2, fan_out: 0 } }),
+    mkSymbol("sym_b", "src/billing/charge.ts", "charge", { calls: ["sym_a"], metrics: { loc: 30, churn_90d: 1, bug_count: 0, fan_in: 0, fan_out: 1 } }),
+    mkSymbol("sym_c", "src/api/mw.ts", "mw", { calls: ["sym_a"], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 1 } }),
+  ]);
   store.json.replaceAll("edges", [
     { id: "e1", from: "sym_b", to: "sym_a", type: "calls", reason: "", strength: 1, provenance: prov() },
     { id: "e2", from: "sym_c", to: "sym_a", type: "calls", reason: "", strength: 1, provenance: prov() },
@@ -74,7 +74,7 @@ test("a 0-byte per-record file (merge-driver tombstone) loads as absent — no c
 
 test("why() matches on path segments, never a bare suffix — 'io.ts' must not pull 'scenario.ts' records (issue #32)", () => {
   const { store, cleanup } = seed();
-  store.json.put("symbols", { id: "sym_scen", file: "src/x/scenario.ts", name: "scen", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 5, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  store.json.put("symbols", mkSymbol("sym_scen", "src/x/scenario.ts", "scen", { metrics: { loc: 5, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 } }) as never);
   store.json.put("decisions", { id: "dec_scen", title: "Scenario decision", status: "accepted", context: "", decision: "x", consequences: [], alternatives_rejected: [], related_components: [], related_files: ["src/x/scenario.ts"], supersedes: null, caused_by_bug: null, commit: null, provenance: prov(0.9), date: "2026-06-01T00:00:00Z" } as never);
   store.reindex();
   const w = store.why("io.ts"); // "scenario.ts".endsWith("io.ts") is true — must NOT match
@@ -87,12 +87,12 @@ test("why() matches on path segments, never a bare suffix — 'io.ts' must not p
 });
 
 test("why() matches an existing full path exactly, never a same-basename suffix — root index.ts must not pull nested/index.ts's records (issue #299)", () => {
-  const { store, root, cleanup } = seed();
-  mkdirSync(join(root, "vscode-extension"), { recursive: true });
-  writeFileSync(join(root, "index.ts"), "export const root = 1;\n");
-  writeFileSync(join(root, "vscode-extension", "index.ts"), "export const nested = 1;\n");
-  store.json.put("symbols", { id: "sym_root_idx", file: "index.ts", name: "root", kind: "variable", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
-  store.json.put("symbols", { id: "sym_nested_idx", file: "vscode-extension/index.ts", name: "nested", kind: "variable", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  const { store, cleanup } = seed();
+  // Deliberately no real files on disk: "is this a real indexed path" must be
+  // answerable from already-loaded graph data alone, never the filesystem — a
+  // deleted-but-still-indexed path must answer the same either way (issue #299).
+  store.json.put("symbols", mkSymbol("sym_root_idx", "index.ts", "root", { kind: "variable" }) as never);
+  store.json.put("symbols", mkSymbol("sym_nested_idx", "vscode-extension/index.ts", "nested", { kind: "variable" }) as never);
   store.json.put("constraints", { id: "con_nested", type: "correctness", statement: "nested rule", scope: ["vscode-extension/index.ts"], severity: "blocking", enforcement: "advisory_v1", rationale: "x", source_decision: null, violations: [], provenance: prov(0.9) } as never);
   store.reindex();
   const wRoot = store.why("index.ts");

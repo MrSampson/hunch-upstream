@@ -78,3 +78,25 @@ test("a persisted task is found for its file and delivered on the next context r
   assert.match(next.text, new RegExp(`${task.task_id} · \\d{4}-\\d{2}-\\d{2} · completed · "Earlier settings work"`));
   assert.equal(store.tasksFor("src/other.js").length, 0, "unrelated files see nothing");
 });
+
+test("tasksFor rewrites an absolute target to repo-relative and never suffix-leaks an unrelated same-basename file (issue #299)", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-task-delivery-"));
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  try {
+    // A real indexed symbol at the target file — the same "is this path known to
+    // the index" question tasksFor now answers the same way why() does.
+    store.json.put("symbols", { id: "sym_auth", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+    store.json.put("tasks", taskRecord({ id: "htask_000000000000000000000010", finished_at: "2026-09-15T00:00:00.000Z", files: ["session.ts"] }));
+    store.json.put("tasks", taskRecord({ id: "htask_000000000000000000000011", finished_at: "2026-09-16T00:00:00.000Z", files: ["src/auth/session.ts"] }));
+    const abs = join(root, "src", "auth", "session.ts");
+    assert.deepEqual(
+      store.tasksFor(abs).map((r) => r.id),
+      ["htask_000000000000000000000011"],
+      "must resolve the absolute target's own task, never the unrelated root-level same-basename file",
+    );
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});

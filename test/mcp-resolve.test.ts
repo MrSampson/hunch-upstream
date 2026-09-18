@@ -1,21 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { tempStore, prov } from "./helpers.js";
+import { tempStore, prov, mkSymbol } from "./helpers.js";
 import { resolveSymbols, resolveFiles } from "../src/mcp/server.js";
 
 function seed() {
   const ctx = tempStore();
   const { store } = ctx;
   store.json.replaceAll("symbols", [
-    { id: "sym_db", file: "src/db.ts", name: "connect", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" },
-    { id: "sym_mongo", file: "src/mongodb.ts", name: "connectMongo", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" },
+    mkSymbol("sym_db", "src/db.ts", "connect"),
+    mkSymbol("sym_mongo", "src/mongodb.ts", "connectMongo"),
     // "datastore" merely CONTAINS "store" as a substring — no "/" boundary before it,
     // so this must never match a "store/db.ts" target (the issue's own example).
-    { id: "sym_datastore_db", file: "src/datastore/db.ts", name: "connectDatastore", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" },
-    { id: "sym_store_db", file: "src/store/db.ts", name: "connectStore", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" },
-    { id: "sym_auth", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" },
-  ] as never);
+    mkSymbol("sym_datastore_db", "src/datastore/db.ts", "connectDatastore"),
+    mkSymbol("sym_store_db", "src/store/db.ts", "connectStore"),
+    mkSymbol("sym_auth", "src/auth/session.ts", "verifySession"),
+  ]);
   store.json.put("constraints", {
     id: "con_1", type: "security", statement: "must not break", scope: ["src/auth/**"], severity: "blocking",
     enforcement: "advisory_v1", rationale: "x", source_decision: null, violations: [], provenance: prov(0.9),
@@ -40,6 +40,48 @@ test("resolveSymbols/resolveFiles rewrite an absolute target to repo-relative be
   const abs = join(root, "src", "auth", "session.ts");
   assert.deepEqual(resolveSymbols(store, abs).map((s) => s.id), ["sym_auth"]);
   assert.deepEqual(resolveFiles(store, abs), ["src/auth/session.ts"]);
+  cleanup();
+});
+
+test("resolveSymbols: the absolute-path rewrite is the ONLY thing that produces the right match — without it, a root-level same-basename file leaks in (issue #296/#299)", () => {
+  // Without the repo-relative rewrite, resolveSymbols falls straight to the
+  // segment-anchored suffix tier on the RAW absolute target. That suffix tier
+  // still happens to find the right file too (any relative path is trivially a
+  // suffix of `root + "/" + thatPath`) — which is exactly why a naive "does it
+  // find sym_auth" assertion doesn't discriminate. But an UNRELATED root-level
+  // "session.ts" is *also* a segment-anchored suffix of that same absolute
+  // string ("…/src/auth/session.ts" ends with "/session.ts"), so the suffix
+  // tier alone returns BOTH files. Only the rewrite lets the exact-file tier
+  // resolve first and return the single correct match.
+  const { store, root, cleanup } = seed();
+  store.json.put("symbols", mkSymbol("sym_root_session", "session.ts", "unrelatedRootSession") as never);
+  const abs = join(root, "src", "auth", "session.ts");
+  assert.deepEqual(resolveSymbols(store, abs).map((s) => s.id), ["sym_auth"], "must resolve to exactly the target file, never the unrelated root-level same-basename file");
+  cleanup();
+});
+
+test("resolveSymbols: exact match wins over a would-be suffix match when both are indexed (issue #299)", () => {
+  const { store, cleanup } = seed();
+  store.json.put("symbols", mkSymbol("sym_root_index", "index.ts", "rootIndex") as never);
+  store.json.put("symbols", mkSymbol("sym_nested_index", "a/index.ts", "nestedIndex") as never);
+  assert.deepEqual(resolveSymbols(store, "index.ts").map((s) => s.id), ["sym_root_index"], "the root index.ts must not also pull in a/index.ts via suffix leakage");
+  assert.deepEqual(resolveSymbols(store, "a/index.ts").map((s) => s.id), ["sym_nested_index"]);
+  cleanup();
+});
+
+test("resolveSymbols: a real indexed file with zero symbols returns [] rather than suffix-leaking an unrelated same-basename file (issue #299)", () => {
+  const { store, cleanup } = seed();
+  // "docs/README.md" has no symbols of its own but IS covered by an indexed
+  // component (a real file with zero tree-sitter symbols — README.md,
+  // package.json, Dockerfile, ...). A root-level "README.md" with a symbol
+  // exists elsewhere in the graph and must never leak in via suffix matching.
+  store.json.put("symbols", mkSymbol("sym_root_readme", "README.md", "rootReadmeSymbol") as never);
+  store.json.put("components", {
+    id: "cmp_docs", kind: "module", name: "docs", responsibility: "", paths: ["docs/**"], status: "active",
+    owners: [], fragility: 0, provenance: prov(0.9), created_at: "", updated_at: "",
+  } as never);
+  assert.deepEqual(resolveSymbols(store, "docs/README.md").map((s) => s.id), [], "a real, indexed, symbol-less file must not fall through to suffix matching");
+  assert.deepEqual(resolveFiles(store, "docs/README.md"), ["docs/README.md"], "resolveFiles still names the file itself even with zero symbols");
   cleanup();
 });
 
