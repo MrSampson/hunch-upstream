@@ -79,6 +79,13 @@ function inlineSpanRanges(text: string): Array<[number, number]> {
  *  fenced code blocks or inline code spans are examples, not declarations,
  *  and are skipped. */
 export function parseDocAnchors(text: string): DocAnchor[] {
+  // `.` in the fence/inline-span regexes below excludes \r, so on a CRLF
+  // checkout (Windows, core.autocrlf=true) a fence line like "```\r" never
+  // matched at all — no fence was detected, and an example marker shown
+  // inside one registered as a live, pinned anchor (issue #298). Normalizing
+  // once here keeps fencedRanges/inlineSpanRanges/MARKER offsets consistent
+  // with each other and with the line numbers reported below.
+  text = text.replace(/\r\n/g, "\n");
   const out: DocAnchor[] = [];
   const skip = [...fencedRanges(text), ...inlineSpanRanges(text)];
   MARKER.lastIndex = 0;

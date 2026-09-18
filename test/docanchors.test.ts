@@ -69,6 +69,21 @@ test("parseDocAnchors: markers inside fenced code blocks are examples, not decla
   assert.deepEqual(parseDocAnchors("```\n<!-- hunch:topic dangling.example -->"), []);
 });
 
+test("parseDocAnchors: a CRLF checkout still detects the fence — an example marker inside one stays inert (issue #298)", () => {
+  const md = [
+    "# How to anchor a doc",
+    "",
+    "```markdown",
+    "<!-- hunch:topic example.topic dec_ffff000009 -->",   // documentation example → must stay ignored on CRLF too
+    "```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",      // outside the fence → live
+    "Prose about the real topic.",
+  ].join("\r\n");
+  const anchors = parseDocAnchors(md);
+  assert.deepEqual(anchors, [{ topic: "real.topic", pin: "dec_aaaa000001", line: 7 }]);
+});
+
 test("parseDocAnchors: markers inside inline code spans are examples too", () => {
   const md = [
     "Anchor a section with `<!-- hunch:topic span.example -->` in the doc.",   // inline span → ignored
