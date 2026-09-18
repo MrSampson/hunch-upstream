@@ -1,7 +1,7 @@
 /** Filesystem layout for the Hunch (DESIGN.md §6 folder structure). */
 import { join } from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 export const HUNCH_DIR = ".hunch";
 
@@ -12,6 +12,22 @@ export const HUNCH_DIR = ".hunch";
  *  `src/auth/session.ts`. Safe on symbol names too: they contain no backslashes. */
 export function toPosixTarget(target: string): string {
   return target.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+/** Rewrite an ABSOLUTE target to repo-relative POSIX form when it falls inside
+ *  `root`. Hunch's stored paths (symbols, constraint scopes, ...) are always
+ *  repo-relative, so a caller that hands over an absolute edit-payload path
+ *  matched nothing (issue #296: hunch_check_constraints / hunch_blast_radius
+ *  returned empty for an absolute target that plainly had a matching rule). A
+ *  relative target, a glob, or an absolute path outside `root` passes through
+ *  unchanged (toPosixTarget'd) — there is nothing safe to rewrite it to. */
+export function repoRelativeTarget(target: string, root: string): string {
+  const t = toPosixTarget(target);
+  const looksAbsolute = isAbsolute(t) || /^[a-zA-Z]:/.test(t);
+  if (!looksAbsolute) return t;
+  const rel = toPosixTarget(relative(root, t));
+  if (!rel || rel === ".." || rel.startsWith("../") || isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) return t;
+  return rel;
 }
 
 export interface HunchPaths {

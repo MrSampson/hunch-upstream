@@ -12,7 +12,7 @@
  */
 import { resolve, join, dirname, isAbsolute, relative } from "node:path";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { toPosixTarget, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
+import { toPosixTarget, repoRelativeTarget, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
 import { ENTITY_KINDS, type Component, type Constraint, type Bug, type Decision, type Symbol, type Edge, type Finding, type RejectedTripwire, type EntityKind, type EntityFor, type TaskRecord } from "../core/types.js";
 import { openDb, withTx, type DB } from "./db.js";
 import { RESET_SQL, embedHash } from "./schema.js";
@@ -1298,13 +1298,22 @@ export class HunchStore {
     // pathsRelated, not bare endsWith: "scenario.ts".endsWith("io.ts") is true,
     // so an unanchored suffix pulled unrelated files' records into why()/the
     // pre-edit grounding block (issue #32). Segment-anchored matching only.
-    const matchedSymbols = symbols.filter((s) => s.file === target || s.name === target || s.id === target || pathsRelated(s.file, target));
+    //
+    // A target that IS an existing full repo-relative path (README.md,
+    // vscode-extension/index.ts, ...) names exactly one file — suffix-matching
+    // it too pulls in every OTHER file that merely shares a basename (issue
+    // #299: root index.ts delivered vscode-extension/index.ts's rules and vice
+    // versa). Suffix matching stays reserved for a target that is not itself a
+    // real path, e.g. a short/partial reference like "x/scenario.ts".
+    const targetIsRealFile = !isAbsolute(target) && existsSync(join(this.paths.root, target));
+    const suffixMatch = (file: string) => !targetIsRealFile && pathsRelated(file, target);
+    const matchedSymbols = symbols.filter((s) => s.file === target || s.name === target || s.id === target || suffixMatch(s.file));
     const symIds = new Set(matchedSymbols.map((s) => s.id));
     const fileSet = new Set(matchedSymbols.map((s) => s.file));
     const isPath = target.includes("/") || target.includes(".");
 
     const fileMatch = (files: string[]) =>
-      files.some((f) => f === target || (isPath && pathsRelated(f, target)) || fileSet.has(f));
+      files.some((f) => f === target || (isPath && suffixMatch(f)) || fileSet.has(f));
 
     return {
       target,
@@ -1549,6 +1558,10 @@ export class HunchStore {
    *  longer enforced. Pass `{ asOf }` to instead return the invariants in force at
    *  that instant (time-travel: "what must I not have broken as of commit X?"). */
   checkConstraints(scope: string, opts: { asOf?: string } = {}): Constraint[] {
+    // Constraint scopes are always repo-relative; an absolute target (an
+    // agent's edit-payload path, verbatim) matched nothing even when a
+    // blocking rule plainly applied (issue #296).
+    scope = repoRelativeTarget(scope, this.paths.root);
     const all = this.recs("constraints");
     const asOf = opts.asOf;
     return all

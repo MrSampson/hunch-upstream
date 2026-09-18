@@ -13,7 +13,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { hunchPaths, findRoot, toPosixTarget } from "../core/paths.js";
+import { hunchPaths, findRoot, toPosixTarget, repoRelativeTarget } from "../core/paths.js";
+import { pathsRelated } from "../core/glob.js";
 import { resolveMcpToolset } from "./toolset.js";
 import { readConfig } from "../core/config.js";
 import { canonicalRootPath, resolveActiveRoot } from "./roots.js";
@@ -526,21 +527,31 @@ function qualityNudge(rec: Decision): string {
 }
 
 /** Resolve a free-form target (symbol id / name / file path) to symbol records. */
-function resolveSymbols(store: HunchStore, target: string): Symbol[] {
-  target = toPosixTarget(target);
+export function resolveSymbols(store: HunchStore, target: string): Symbol[] {
+  // An absolute target (an agent's edit-payload path, verbatim) never matched
+  // the repo-relative stored file paths below (issue #296).
+  target = repoRelativeTarget(target, store.publicRoot);
   const syms = store.json.loadAll("symbols");
   const byId = syms.find((s) => s.id === target);
   if (byId) return [byId];
   const byName = syms.filter((s) => s.name === target);
   if (byName.length) return byName;
-  return syms.filter((s) => s.file === target || s.file.endsWith(target));
+  // Exact match first: a target that IS a real indexed file names exactly one
+  // file. Bare `endsWith` (no segment boundary) matched unrelated files that
+  // merely end in the same characters — "db.ts" matched "mongodb.ts" (issue
+  // #300). Segment-anchored `pathsRelated` fixes that, but only once exact
+  // matches are exhausted, or it reintroduces the same hazard for a target
+  // that is itself a full path but merely shares a basename with another file.
+  const exact = syms.filter((s) => s.file === target);
+  if (exact.length) return exact;
+  return syms.filter((s) => pathsRelated(s.file, target));
 }
 
 /** Resolve a target to canonical indexed file path(s) (for file-granular blast
  *  radius). Falls back to the literal target so direct-scope checks still run. */
-function resolveFiles(store: HunchStore, target: string): string[] {
+export function resolveFiles(store: HunchStore, target: string): string[] {
   const files = new Set(resolveSymbols(store, target).map((s) => s.file));
-  return files.size ? [...files] : [toPosixTarget(target)];
+  return files.size ? [...files] : [repoRelativeTarget(target, store.publicRoot)];
 }
 
 type PreparedRoot = {

@@ -86,6 +86,24 @@ test("why() matches on path segments, never a bare suffix — 'io.ts' must not p
   cleanup();
 });
 
+test("why() matches an existing full path exactly, never a same-basename suffix — root index.ts must not pull nested/index.ts's records (issue #299)", () => {
+  const { store, root, cleanup } = seed();
+  mkdirSync(join(root, "vscode-extension"), { recursive: true });
+  writeFileSync(join(root, "index.ts"), "export const root = 1;\n");
+  writeFileSync(join(root, "vscode-extension", "index.ts"), "export const nested = 1;\n");
+  store.json.put("symbols", { id: "sym_root_idx", file: "index.ts", name: "root", kind: "variable", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  store.json.put("symbols", { id: "sym_nested_idx", file: "vscode-extension/index.ts", name: "nested", kind: "variable", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  store.json.put("constraints", { id: "con_nested", type: "correctness", statement: "nested rule", scope: ["vscode-extension/index.ts"], severity: "blocking", enforcement: "advisory_v1", rationale: "x", source_decision: null, violations: [], provenance: prov(0.9) } as never);
+  store.reindex();
+  const wRoot = store.why("index.ts");
+  assert.deepEqual(wRoot.symbols.map((s) => s.id), ["sym_root_idx"], "root index.ts must not resolve the nested symbol");
+  assert.deepEqual(wRoot.constraints.map((c) => c.id), [], "root index.ts must not inherit the nested-scoped constraint");
+  const wNested = store.why("vscode-extension/index.ts");
+  assert.deepEqual(wNested.symbols.map((s) => s.id), ["sym_nested_idx"]);
+  assert.deepEqual(wNested.constraints.map((c) => c.id), ["con_nested"]);
+  cleanup();
+});
+
 test("replaceAll writes new records BEFORE deleting stale ones — a mid-operation failure never empties the kind (issue #30)", () => {
   const { store, root, cleanup } = seed();
   store.json.put("decisions", { id: "dec_keeper", title: "keeper", status: "accepted", context: "", decision: "", consequences: [], alternatives_rejected: [], related_components: [], related_files: [], supersedes: null, caused_by_bug: null, commit: null, provenance: prov(0.9), date: "2026-06-01T00:00:00Z" } as never);
