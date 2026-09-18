@@ -4278,12 +4278,19 @@ program
   .requiredOption("--by <new>", "decision id that supersedes it")
   .action((oldId: string, opts: { by: string }) => {
     const { store, root } = storeFor();
-    const by = store.json.get("decisions", opts.by);
+    // Resolve from wherever each decision actually lives (issue #294): `store.json`
+    // is the public store only, so in unified ("shared") mode — where every decision
+    // lives in the overlay — `--by` always failed "not found", and a private-overlay
+    // `old` could never be superseded from the CLI at all. `old`'s home decides which
+    // store the close is written to and flushed; the MCP write path (server.ts) routes
+    // the same way.
+    const by = store.getRec("decisions", opts.by);
     if (!by) { store.close(); return fail(`--by decision "${opts.by}" not found`); }
-    const closed = store.supersede(oldId, by);
+    const home = decisionMemoryHome(store, oldId);
+    const closed = home === "private" ? store.supersedePrivate(oldId, by) : store.supersede(oldId, by);
     if (!closed) { store.close(); return fail(`decision "${oldId}" not found (or same as --by)`); }
     store.reindex();
-    pumpMemoryHome(store, root, "public", `hunch: supersede ${oldId} by ${opts.by}`);
+    pumpMemoryHome(store, root, home, `hunch: supersede ${oldId} by ${opts.by}`);
     console.log(`✓ ${oldId} superseded by ${opts.by} — window closed at ${closed.valid_to?.slice(0, 10)}.`);
     store.close();
   });
