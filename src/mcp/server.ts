@@ -14,7 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { hunchPaths, findRoot, toPosixTarget, repoRelativeTarget } from "../core/paths.js";
-import { pathsRelated } from "../core/glob.js";
+import { isIndexedPath, matchSymbolsTiered } from "../core/glob.js";
 import { resolveMcpToolset } from "./toolset.js";
 import { readConfig } from "../core/config.js";
 import { canonicalRootPath, resolveActiveRoot } from "./roots.js";
@@ -526,25 +526,24 @@ function qualityNudge(rec: Decision): string {
   return "";
 }
 
-/** Resolve a free-form target (symbol id / name / file path) to symbol records. */
+/** Resolve a free-form target (symbol id / name / file path) to symbol records.
+ *  Tiered exact-id > exact-name > exact-file > segment-anchored-suffix matching,
+ *  shared with `HunchStore.why()` via `matchSymbolsTiered` so the two don't drift
+ *  apart on the same question. */
 export function resolveSymbols(store: HunchStore, target: string): Symbol[] {
   // An absolute target (an agent's edit-payload path, verbatim) never matched
   // the repo-relative stored file paths below (issue #296).
   target = repoRelativeTarget(target, store.publicRoot);
   const syms = store.json.loadAll("symbols");
-  const byId = syms.find((s) => s.id === target);
-  if (byId) return [byId];
-  const byName = syms.filter((s) => s.name === target);
-  if (byName.length) return byName;
-  // Exact match first: a target that IS a real indexed file names exactly one
-  // file. Bare `endsWith` (no segment boundary) matched unrelated files that
-  // merely end in the same characters — "db.ts" matched "mongodb.ts" (issue
-  // #300). Segment-anchored `pathsRelated` fixes that, but only once exact
-  // matches are exhausted, or it reintroduces the same hazard for a target
-  // that is itself a full path but merely shares a basename with another file.
-  const exact = syms.filter((s) => s.file === target);
-  if (exact.length) return exact;
-  return syms.filter((s) => pathsRelated(s.file, target));
+  const components = store.json.loadAll("components");
+  // A target that IS a real indexed path (has a symbol, or is covered by an
+  // indexed component even with zero symbols — README.md, package.json, ...)
+  // never falls through to the suffix tier: bare `endsWith` matched unrelated
+  // files that merely end in the same characters — "db.ts" matched "mongodb.ts"
+  // (issue #300), and a same-basename file in another directory leaked its
+  // rules onto a real indexed target with no symbols of its own (issue #299).
+  const indexed = isIndexedPath(target, syms.map((s) => s.file), components.map((c) => c.paths));
+  return matchSymbolsTiered(target, syms, indexed);
 }
 
 /** Resolve a target to canonical indexed file path(s) (for file-granular blast
