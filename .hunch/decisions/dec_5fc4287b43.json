@@ -4,12 +4,12 @@
   "topic": null,
   "status": "accepted",
   "context": "CommonMark recognizes three line endings (CRLF, LF, lone CR). The prior fix for issue #298 only normalized CRLF pairs. More fundamentally, regex-based fence/span detection (using . and $ anchors) assumes LF-normalized text; absent normalization, CRLF checkouts miss fence boundaries and misclassify example markers as live anchors.",
-  "decision": "Changed parseDocAnchors's normalization regex from /\\r\\n/g to /\\r\\n?/g to catch all three line-ending forms in one place. Added explicit LF-normalized-input preconditions to fencedRanges and inlineSpanRanges docstrings, with citations to the normalization logic and the math that assumes single-char line endings.",
+  "decision": "Changed parseDocAnchors's normalization regex from /\\r\\n/g to /\\r\\n?/g to catch all three line-ending forms in one place. Added explicit LF-normalized-input preconditions to fencedRanges and inlineSpanRanges docstrings, each citing the actual mechanism that makes it sensitive to unnormalized input.",
   "consequences": [
     "All line-ending variants now normalized uniformly at the single entry point",
     "Precondition documentation on helpers catches future direct-call violations at review time",
-    "Clarified that only fencedRanges's . and $ anchors are CRLF-sensitive; inlineSpanRanges was never affected",
-    "Mixed LF/CRLF documents and unclosed CRLF fences pinned with new test cases"
+    "fencedRanges is CRLF-sensitive (its fence-line regex's . excludes \\r) and inlineSpanRanges is lone-CR-sensitive (split(\"\\n\") doesn't split a bare CR, so same-line backtick pairing can span logical lines) — both real, distinct mechanisms; a lone-CR regression test fails without the /\\r\\n?/g widening, proving inlineSpanRanges was affected too",
+    "Mixed LF/CRLF documents, unclosed CRLF fences, and a lone-CR document pinned with new test cases"
   ],
   "alternatives_rejected": [
     "Normalize line endings separately in each helper (fencedRanges, inlineSpanRanges, MARKER) — scattered logic, unclear contracts, easier to miss a call site",
