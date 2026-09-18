@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tempStore, prov } from "./helpers.js";
+import { tempStore, prov, mkSymbol } from "./helpers.js";
 import { formatContext } from "../src/core/format.js";
 import { computeDrift } from "../src/core/drift.js";
 import { findingId } from "../src/core/ids.js";
@@ -83,7 +83,7 @@ test("liveFindingsFor rewrites an absolute target to repo-relative and never suf
   const { store, root, cleanup } = tempStore();
   // A real indexed symbol at the target file — the same "is this path known to
   // the index" question liveFindingsFor now answers the same way why() does.
-  store.json.put("symbols", { id: "sym_auth", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  store.json.put("symbols", mkSymbol("sym_auth", "src/auth/session.ts", "verifySession") as never);
   store.json.put("findings", finding({ title: "root-level unrelated", affected_files: ["session.ts"] }));
   store.json.put("findings", finding({ title: "the real target", affected_files: ["src/auth/session.ts"] }));
   const abs = join(root, "src", "auth", "session.ts");

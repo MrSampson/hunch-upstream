@@ -11,6 +11,7 @@ import { persistTaskRecord } from "../src/core/taskRecord.js";
 import { TaskRecordSchema, type TaskRecord } from "../src/core/types.js";
 import { HunchStore, type AssembledContext } from "../src/store/hunchStore.js";
 import { hunchPaths } from "../src/core/paths.js";
+import { mkSymbol } from "./helpers.js";
 
 function taskRecord(over: Partial<TaskRecord> & { id: string; finished_at: string }): TaskRecord {
   return TaskRecordSchema.parse({
@@ -86,7 +87,7 @@ test("tasksFor rewrites an absolute target to repo-relative and never suffix-lea
   try {
     // A real indexed symbol at the target file — the same "is this path known to
     // the index" question tasksFor now answers the same way why() does.
-    store.json.put("symbols", { id: "sym_auth", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 1, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+    store.json.put("symbols", mkSymbol("sym_auth", "src/auth/session.ts", "verifySession") as never);
     store.json.put("tasks", taskRecord({ id: "htask_000000000000000000000010", finished_at: "2026-09-15T00:00:00.000Z", files: ["session.ts"] }));
     store.json.put("tasks", taskRecord({ id: "htask_000000000000000000000011", finished_at: "2026-09-16T00:00:00.000Z", files: ["src/auth/session.ts"] }));
     const abs = join(root, "src", "auth", "session.ts");

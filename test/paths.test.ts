@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repoRelativeTarget } from "../src/core/paths.js";
+import { SYMLINK_SKIP } from "./helpers.js";
 
 /** Direct unit coverage for `repoRelativeTarget`'s edge cases — the shared
  *  absolute-to-repo-relative normalizer folded from `src/cli/index.ts`'s
@@ -61,4 +62,22 @@ test("repoRelativeTarget: a Windows drive-letter path rewrites correctly against
   const root = "C:\\Users\\dev\\repo";
   const target = "C:\\Users\\dev\\repo\\src\\foo.ts";
   assert.equal(repoRelativeTarget(target, root), "src/foo.ts");
+});
+
+test("repoRelativeTarget: a target arriving via a symlinked root still resolves (dec_e0a36efbf5)", { skip: SYMLINK_SKIP }, () => {
+  // The macOS /var -> /private/var case: findRoot() resolves the real path, but a hook
+  // event's file_path arrives un-resolved through the symlink. A naive relative() would
+  // yield a bogus "../" path; the realpath fold this function was consolidated from
+  // (src/cli/index.ts's toRepoRel) must still cancel that out.
+  const base = mkdtempSync(join(tmpdir(), "hunch-paths-symlink-"));
+  try {
+    const realRoot = join(base, "real-repo");
+    mkdirSync(join(realRoot, "src"), { recursive: true });
+    writeFileSync(join(realRoot, "src", "session.ts"), "x");
+    const linkRoot = join(base, "linked-repo");
+    symlinkSync(realRoot, linkRoot);
+    assert.equal(repoRelativeTarget(join(linkRoot, "src", "session.ts"), realRoot), "src/session.ts");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

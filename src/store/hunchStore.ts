@@ -1594,7 +1594,7 @@ export class HunchStore {
       .filter(live)
       .filter((f) =>
         f.affected_files.some((af) => pathMatchesGlob(t, af) || pathMatchesGlob(af, t) || (!indexed && pathsRelated(toPosixTarget(af), t)))
-        || f.affected_symbols.some((s) => s === scope))
+        || f.affected_symbols.some((s) => s === t))
       .sort((a, b) => (SEV_FINDING[b.severity] ?? 0) - (SEV_FINDING[a.severity] ?? 0) || a.id.localeCompare(b.id));
   }
 
