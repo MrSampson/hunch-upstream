@@ -95,6 +95,13 @@ test("parseDocAnchors: an unclosed fence on CRLF still swallows everything to EO
   assert.deepEqual(parseDocAnchors("```\r\n<!-- hunch:topic dangling.example -->"), []);
 });
 
+test("parseDocAnchors: a lone-CR document — stray backticks on different lines must not pair into a false span", () => {
+  // split("\n") does not split on a bare \r, so without normalization the whole
+  // document is one "line" and the same-line pairing rule swallows the marker.
+  const md = "stray ` backtick\r<!-- hunch:topic real.topic dec_aaaa000001 -->\ranother stray ` backtick\r";
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 2 }]);
+});
+
 test("parseDocAnchors: markers inside inline code spans are examples too", () => {
   const md = [
     "Anchor a section with `<!-- hunch:topic span.example -->` in the doc.",   // inline span → ignored

@@ -31,8 +31,8 @@ const MARKER = /<!--\s*hunch:topic\s+([A-Za-z0-9._/-]+)(?:\s+(dec_[A-Za-z0-9]+))
  *  CommonMark-lite: a fence of N chars (≤3 leading spaces) closes only on a
  *  line of ≥N of the same char and nothing else; an unclosed fence runs to
  *  EOF; a backtick fence's info string may not itself contain a backtick.
- *  Expects LF-normalized text — see parseDocAnchors's CRLF normalization
- *  (issue #298); a caller that skips it re-opens the CRLF fence-detection bug. */
+ *  Expects LF-normalized text — see parseDocAnchors's normalization; a
+ *  caller that skips it re-opens the CRLF fence-detection bug. */
 function fencedRanges(text: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
   let open: { ch: string; len: number; start: number } | null = null;
@@ -58,9 +58,10 @@ function fencedRanges(text: string): Array<[number, number]> {
  *  fencedRanges: prose quoting a marker in backticks is showing an example.
  *  CommonMark-lite: an opener run pairs with the next run of the SAME length
  *  on the same line; unpaired runs never open a span.
- *  Expects LF-normalized text — see parseDocAnchors's CRLF normalization
- *  (issue #298); this function's own `offset += line.length + 1` line-offset
- *  math already assumes a single-character line ending. */
+ *  Expects LF-normalized text — see parseDocAnchors's normalization.
+ *  `split("\n")` does not split a bare CR, so on CR-only input the whole
+ *  document reads as one line and stray backticks on different lines
+ *  falsely pair. */
 function inlineSpanRanges(text: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
   let offset = 0;
@@ -84,13 +85,13 @@ function inlineSpanRanges(text: string): Array<[number, number]> {
  *  fenced code blocks or inline code spans are examples, not declarations,
  *  and are skipped. */
 export function parseDocAnchors(text: string): DocAnchor[] {
-  // `.` in fencedRanges's fence-line regex excludes \r, so on a CRLF checkout
-  // (Windows, core.autocrlf=true) a fence line like "```\r" never matched at
-  // all — no fence was detected, and an example marker shown inside one
-  // registered as a live, pinned anchor (issue #298). Normalizing once here
-  // (also covers a lone CR, which CommonMark counts as its own line ending)
-  // keeps fencedRanges/inlineSpanRanges/MARKER offsets consistent with each
-  // other and with the line numbers reported below.
+  // fencedRanges is CRLF-sensitive (its fence-line regex's `.` excludes \r, so
+  // "```\r" never matched at all on a CRLF checkout); inlineSpanRanges is
+  // lone-CR-sensitive (split("\n") doesn't split a bare CR — see its
+  // docblock). Either way an example marker inside a fence/span registered as
+  // a live, pinned anchor. Normalizing both CRLF and lone CR once here keeps
+  // fencedRanges/inlineSpanRanges/MARKER offsets consistent with each other
+  // and with the line numbers reported below.
   text = text.replace(/\r\n?/g, "\n");
   const out: DocAnchor[] = [];
   const skip = [...fencedRanges(text), ...inlineSpanRanges(text)];
