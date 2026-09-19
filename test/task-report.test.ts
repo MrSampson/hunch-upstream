@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildDeliveryEnvelope } from "../src/core/delivery.js";
 import type { AssembledContext } from "../src/store/hunchStore.js";
-import { beginReportCheck, CHECK_RESULT_GRACE_MS, finishReportTask, listReportTasks, pruneReportHistory, readLessonHistory, readTaskReport, recordReportClaim, recordTaskDelivery, reportHash, startReportTask } from "../src/core/taskReport.js";
+import { beginReportCheck, CHECK_RESULT_GRACE_MS, finishReportTask, listReportTasks, pruneReportHistory, readLessonHistory, readTaskReport, recordReportCheck, recordReportClaim, recordTaskDelivery, reportHash, settleSessionTasks, startReportTask } from "../src/core/taskReport.js";
 import { reportSourceSnapshot, runReportCheck, snapshotDeliveredRecords } from "../src/core/taskReportEvidence.js";
 import { renderTaskReport, renderTaskReportHtml, writeTaskReportHtml } from "../src/core/taskReportRender.js";
 import { recordServed, servedSummary, withServedDatabase } from "../src/core/served.js";
@@ -229,6 +229,23 @@ test("a verification whose runner died stops blocking completion after its own t
   const report = readTaskReport(root, task.task_id);
   assert.equal(report.checks.length, 0, "no result is ever invented for a dead runner");
   assert.match(report.unknowns.join(" "), /not retained/);
+});
+
+test("a finished old verification never cancels out a running one", t => {
+  const sessionKey = reportHash("pending-checks-session");
+  const root = fixture(t), task = startReportTask(root, "Two verifications", undefined, { session_key: sessionKey });
+  // Check one runs to a result, then ages past its own timeout plus the grace.
+  const first = beginReportCheck(root, task.task_id, "First suite", 1_000);
+  recordReportCheck(root, task.task_id, { check_id: first, label: "First suite", command: [process.execPath, "-e", "process.exit(0)"], exit_code: 0, output_hash: reportHash("first"), before_snapshot: null, after_snapshot: null, snapshot_limitations: [], timed_out: false, source: "local-command-runner" });
+  withServedDatabase(root, db => { db.prepare("UPDATE report_events SET at = ? WHERE event_id = ?").run(new Date(Date.now() - 1_000 - CHECK_RESULT_GRACE_MS - 5_000).toISOString(), first); });
+  // Check two is still running: its own start is the only thing that counts.
+  const second = beginReportCheck(root, task.task_id, "Second suite", 60_000);
+  assert.throws(() => finishReportTask(root, task.task_id), /verification is still running/, "the stale first result must not net out the live second start");
+  assert.deepEqual(settleSessionTasks(root, sessionKey), [], "host close leaves a task whose verification may still report");
+  assert.equal(listReportTasks(root).find(row => row.task_id === task.task_id)?.state, "open");
+  recordReportCheck(root, task.task_id, { check_id: second, label: "Second suite", command: [process.execPath, "-e", "process.exit(1)"], exit_code: 1, output_hash: reportHash("second"), before_snapshot: null, after_snapshot: null, snapshot_limitations: [], timed_out: false, source: "local-command-runner" });
+  assert.equal(finishReportTask(root, task.task_id).state, "completed");
+  assert.deepEqual(readTaskReport(root, task.task_id).checks.map(c => c.label), ["First suite", "Second suite"], "both results are retained");
 });
 
 test("completion cannot discard an in-flight command result", async t => {

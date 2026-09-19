@@ -321,10 +321,12 @@ function newestSessionTask(db: Database, root: string, sessionKey: string): Repo
 export function latestSessionTask(root: string, sessionKey: string): ReportTask | null {
   return taskDb(root, db => newestSessionTask(db, root, sessionKey));
 }
-/** Check-starts still inside their own timeout plus the grace window, minus the
- * results that arrived: while positive, a runner may still deliver a result. */
+/** Check-starts still inside their own timeout plus the grace window whose own
+ * result has not arrived: while positive, a runner may still deliver a result.
+ * A result clears the start it names (its `check_id`) and nothing else — netting
+ * results against starts let a finished old check hide a running new one. */
 function pendingChecks(db: Database, taskId: string): number {
-  const { pending } = db.prepare(`SELECT SUM(CASE WHEN kind = 'check-start' AND (julianday('now') - julianday(at)) * 86400000 < COALESCE(json_extract(body, '$.timeout_ms'), ${MAX_PENDING_CHECK_MS}) + ${CHECK_RESULT_GRACE_MS} THEN 1 WHEN kind = 'check' AND json_extract(body, '$.check_id') IS NOT NULL THEN -1 ELSE 0 END) AS pending FROM report_events WHERE task_id = ?`).get(taskId) as { pending: number | null };
+  const { pending } = db.prepare(`SELECT COUNT(*) AS pending FROM report_events s WHERE s.task_id = ? AND s.kind = 'check-start' AND (julianday('now') - julianday(s.at)) * 86400000 < COALESCE(json_extract(s.body, '$.timeout_ms'), ${MAX_PENDING_CHECK_MS}) + ${CHECK_RESULT_GRACE_MS} AND NOT EXISTS (SELECT 1 FROM report_events c WHERE c.task_id = s.task_id AND c.kind = 'check' AND json_extract(c.body, '$.check_id') = s.event_id)`).get(taskId) as { pending: number | null };
   return pending ?? 0;
 }
 /** Tasks of a session that an earlier prompt left open are over once the
@@ -517,8 +519,7 @@ export function finishReportTask(root: string, taskId: string, state: "completed
       return task;
     }
     if (state === "completed") {
-      const { pending } = db.prepare(`SELECT SUM(CASE WHEN kind = 'check-start' AND (julianday('now') - julianday(at)) * 86400000 < COALESCE(json_extract(body, '$.timeout_ms'), ${MAX_PENDING_CHECK_MS}) + ${CHECK_RESULT_GRACE_MS} THEN 1 WHEN kind = 'check' AND json_extract(body, '$.check_id') IS NOT NULL THEN -1 ELSE 0 END) AS pending FROM report_events WHERE task_id = ?`).get(taskId) as { pending: number | null };
-      if ((pending ?? 0) > 0) throw new Error("verification is still running or was interrupted; wait for its result or close the task as interrupted");
+      if (pendingChecks(db, taskId) > 0) throw new Error("verification is still running or was interrupted; wait for its result or close the task as interrupted");
     }
     const finished = TaskSchema.parse({ ...task, state, finished_at: new Date().toISOString(), closed_by: by });
     db.prepare("UPDATE report_tasks SET body = ? WHERE task_id = ?").run(JSON.stringify(finished), taskId);
