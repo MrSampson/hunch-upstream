@@ -180,6 +180,11 @@ export function aliasReportTask(root: string, aliasId: string, taskId: string): 
 export function resolveReportTask(root: string, id: string): string {
   return taskDb(root, db => (db.prepare("SELECT task_id FROM report_task_aliases WHERE alias_id = ?").get(id) as { task_id: string } | undefined)?.task_id ?? id);
 }
+/** Whether a task id names a real task of THIS repository/worktree. */
+export function reportTaskExists(root: string, id: string): boolean {
+  TaskIdSchema.parse(id);
+  return taskDb(root, db => !!db.prepare("SELECT 1 FROM report_tasks WHERE task_id = ? AND scope IN (?, ?, ?)").get(id, ...scopePair(root)));
+}
 
 function deliveryRecords(kind: string, body: unknown): ReportRecord[] {
   if (kind === "save") return [ReportSaveSchema.parse(body).record];
