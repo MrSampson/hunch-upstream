@@ -149,10 +149,12 @@ interface HookEntry {
  *  its matcher and the user's remaining commands in order, and is dropped only
  *  when nothing of the user's is left. Dropping the whole entry deleted user
  *  hooks (con_8460b6770f, issue #310). */
-function withoutHunchCommands(entry: HookEntry): HookEntry | null {
+function withoutHunchCommands(entry: HookEntry, hookCmd: string): HookEntry | null {
   const hooks = entry.hooks;
   if (!Array.isArray(hooks)) return entry;
-  const kept = hooks.filter((h) => !(typeof h.command === "string" && isHunchHookCommand(h.command, false)));
+  // The command being installed is ours by definition, whatever shape a future
+  // launcher takes — so a re-run stays idempotent even if the matcher lags it.
+  const kept = hooks.filter((h) => !(typeof h?.command === "string" && (h.command === hookCmd || isHunchHookCommand(h.command, false))));
   if (kept.length === hooks.length) return entry;
   return kept.length ? { ...entry, hooks: kept } : null;
 }
@@ -165,7 +167,7 @@ function withoutHunchCommands(entry: HookEntry): HookEntry | null {
  *   - UserPromptSubmit → remind the agent to consult Hunch.
  * Both invoke `hunch hook`, which reads the firmness level from .hunch/config.json
  * at run time — so changing firmness needs no settings.json edit. We own only our
- * entries (matched by isHunchHook): other hooks and settings are preserved, and a
+ * commands (matched by isHunchHookCommand): other hooks and settings are preserved, and a
  * non-empty file we cannot parse THROWS rather than clobbering the user's config.
  */
 export function installClaudeHooks(root: string, hookCmd: string): ClaudeHookInstall {
@@ -197,7 +199,7 @@ export function installClaudeHooks(root: string, hookCmd: string): ClaudeHookIns
     }
   }
   const keep = (arr?: HookEntry[]) =>
-    (Array.isArray(arr) ? arr.map(withoutHunchCommands).filter((e): e is HookEntry => e !== null) : []);
+    (Array.isArray(arr) ? arr.map((entry) => withoutHunchCommands(entry, hookCmd)).filter((e): e is HookEntry => e !== null) : []);
 
   json.hooks.PreToolUse = [
     ...keep(json.hooks.PreToolUse),

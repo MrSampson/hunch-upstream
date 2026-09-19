@@ -20,18 +20,42 @@
  * form (written before the quoting fix, and by hunch versions that predate
  * --provider) may omit it, and its quotes keep it unambiguous. Claude Code's own
  * settings.json never carries --provider, so a bare `hook` tail is all that is
- * left to match on — and a bare tail alone is far too weak, so there the
- * source-install launcher must additionally be a QUOTED path, which is how
- * resolveInvocation renders it. That keeps an unrelated tool which merely shares
- * Hunch's layout (`node tools/lint/dist/cli/index.js hook`) foreign; deleting it
- * was issue #310. */
+ * left to match on — and a bare tail alone is far too weak, so there the WHOLE
+ * command must be one of the two shapes `hunch init` has ever written (see
+ * isClaudeCodeHookCommand). */
 export function isHunchHookCommand(command: string, requireProvider: boolean): boolean {
+  if (!requireProvider) return isClaudeCodeHookCommand(command);
   const published = /@davesheffer\/hunch/.test(command);
-  if (!requireProvider) {
-    const launcher = published || /"[^"]*(?:dist|src)[\\/]+cli[\\/]+index\.(?:js|ts)"/.test(command);
-    return launcher && /\s"?hook"?\s*$/.test(command);
-  }
   const launcher = published || /(?:dist|src)[\\/]+cli[\\/]+index\.(?:js|ts)(?=["\s]|$)/.test(command);
   const legacyTail = /\s"hook"(?:\s+"--provider"\s+"[a-z]+")?\s*$/.test(command);
   return launcher && (legacyTail || /\s"?hook"?\s+"?--provider"?\s+"?[a-z]+"?\s*$/.test(command));
+}
+
+const ABSOLUTE = String.raw`(?:\/|[A-Za-z]:[\\/]|\\\\)`;
+const CLI_ENTRY = String.raw`[\\/](?:dist|src)[\\/]+cli[\\/]+index\.(?:js|ts)`;
+const SOURCE_HOOK = new RegExp(
+  String.raw`^\s*(?:"?npx(?:\.cmd)?"?\s+"?tsx"?|"[^"]+"|\S+)\s+(?:"${ABSOLUTE}[^"]*${CLI_ENTRY}"|${ABSOLUTE}\S*${CLI_ENTRY})\s+"?hook"?\s*$`,
+);
+
+/** The bare-`hook` shapes written into .claude/settings.json, matched as a whole
+ *  command so nothing chained before or after one can be swept out with it:
+ *
+ *   - published: `npx -y --package=[hunch-exact@npm:]@davesheffer/hunch[@v] hunch hook`
+ *   - source / `npm link` / dev: `<runtime> <ABSOLUTE …/dist|src/cli/index.js|ts> hook`
+ *
+ *  Quoting is NOT the discriminator. shellInvocation() leaves a safe token bare, so
+ *  since v1.21.1 a POSIX source install writes `/usr/bin/node /abs/dist/cli/index.js
+ *  hook` with no quotes at all (quotes appear only for a space or a Windows
+ *  backslash, and on every token before v1.21.1). Requiring them left our own hook
+ *  in place and appended another on each `hunch init`. What every version shares is
+ *  an absolute entry path — resolveInvocation() derives it from import.meta.url —
+ *  and that is what keeps a tool which merely shares the layout
+ *  (`node tools/lint/dist/cli/index.js hook`) foreign; deleting it was issue #310.
+ *  A foreign tool invoked by ABSOLUTE path with this exact layout and a lone `hook`
+ *  argument is still indistinguishable by string alone. */
+function isClaudeCodeHookCommand(command: string): boolean {
+  const published = /^\s*"?npx(?:\.cmd)?"?\s+/i.test(command)
+    && /--package=(?:hunch-exact@npm:)?@davesheffer\/hunch(?:@[^"\s]+)?(?=["\s])/.test(command)
+    && /\s"?hunch"?\s+"?hook"?\s*$/.test(command);
+  return published || SOURCE_HOOK.test(command);
 }
