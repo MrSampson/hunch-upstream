@@ -142,6 +142,8 @@ export function runReportConformance(root: string, store: HunchStore, taskId: st
  * not a verdict. */
 export const DEFAULT_CHECK_TIMEOUT_MS = 15 * 60_000;
 export const MAX_CHECK_TIMEOUT_MS = 6 * 60 * 60_000;
+/** After the command itself exits, everything it wrote is already in the pipe; the window only lets those buffered chunks be read before settling. */
+const EXIT_DRAIN_MS = 500;
 /** A deliberately explicit command wrapper. The caller chooses the command;
  * reports never execute commands automatically to validate submitted claims. */
 export async function runReportCheck(root: string, taskId: string, command: string[], label: string, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, options: {
@@ -187,13 +189,14 @@ export async function runReportCheck(root: string, taskId: string, command: stri
     }
     const child = started;
     let timedOut = false, cancelled = false, settled = false;
-    let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+    let cleanupTimer: ReturnType<typeof setTimeout> | undefined, drainTimer: ReturnType<typeof setTimeout> | undefined;
     const settle = (code: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", cancel);
       if (cleanupTimer) clearTimeout(cleanupTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       child.stdout.destroy(); child.stderr.destroy();
       resolveResult({ code, timedOut, cancelled, hash: reportHash({ stdout: stdout.digest("hex"), stderr: stderr.digest("hex") }) });
     };
@@ -219,6 +222,16 @@ export async function runReportCheck(root: string, taskId: string, command: stri
       const message = launchFailure(error);
       if (!settled) { stderr.update(message); options.onStderr?.(message); }
       settle(null);
+    });
+    // `close` waits for EVERY holder of the stdio pipes; a command that leaves a
+    // helper inheriting stdout (dev server, watcher) and exits 0 would otherwise
+    // burn the whole budget and be recorded as a timeout (#304). The command's own
+    // `exit` is the result; settle on it after a short drain of the buffered output.
+    child.once("exit", code => {
+      if (settled) return;
+      // The command finished inside its budget; the drain window is not part of it.
+      if (code !== null && !timedOut) clearTimeout(timer);
+      drainTimer = setTimeout(() => settle(code), EXIT_DRAIN_MS);
     });
     child.once("close", code => settle(code));
     options.signal?.addEventListener("abort", cancel, { once: true });
