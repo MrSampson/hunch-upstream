@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { devNull, tmpdir } from "node:os";
 import { isAbsolute, resolve, join, basename, dirname, relative, sep } from "node:path";
-import { mkdtempSync, openSync, closeSync, readSync, mkdirSync, rmSync, statSync, lstatSync, realpathSync, readFileSync, renameSync, readdirSync } from "node:fs";
+import { mkdtempSync, openSync, closeSync, readSync, mkdirSync, rmSync, statSync, lstatSync, realpathSync, readFileSync, renameSync, readdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MEMLOG_FORMAT } from "../core/memorylog.js";
 import { hunchAttributesAreSafe, hunchTreeAttributesAreSafe, safeOverlayGitTreeListing, safeOverlayTree } from "../core/overlaySafety.js";
@@ -1623,6 +1623,16 @@ type CommitLockAttempt =
   | { state: "held-unknown" };
 
 const UNKNOWN_LOCK_STALE_MS = 10 * 60_000;
+// An owner-less lock directory is also a NORMAL transient state: the window
+// between the two mkdir calls in createOwnedCommitLock, the release window where
+// recursive cleanup removes owner-<pid> before the outer directory, and a lost
+// reclaim race. This bounds how long a lock may stay owner-less before it is
+// treated as stranded. At ENTRY it is compared with the directory's mtime
+// (creating the directory, or adding/removing a child entry, touches it), so an
+// old stranded lock no-ops instantly. INSIDE the wait loop it is a local
+// continuously-owner-less timer instead, so the wait depends on neither
+// filesystem mtime semantics nor clock agreement between writers.
+const OWNERLESS_LOCK_FRESH_MS = 2_000;
 
 function createOwnedCommitLock(lock: string): boolean {
   let created = false;
@@ -1631,7 +1641,8 @@ function createOwnedCommitLock(lock: string): boolean {
     // is NOT exclusive on POSIX: it may replace an already-existing empty lock
     // directory, which would steal a fresh legacy/ownerless lock. There is a
     // harmless ownerless window between these two mkdir calls; contenders treat
-    // it as held until the conservative legacy TTL expires.
+    // it as held, waiting it out while the directory is freshly touched and
+    // reclaiming it only after the conservative legacy TTL expires.
     mkdirSync(lock);
     created = true;
     // Empty directories are not Git worktree entries, so owner metadata cannot
@@ -1700,22 +1711,55 @@ function acquireCommitLock(lock: string): CommitLockAttempt {
   return createOwnedCommitLock(lock) ? { state: "acquired" } : { state: "held-unknown" };
 }
 
+/** Is an owner-less lock directory recent enough to be a transient window
+ * rather than a stranded one? Only meaningful for the FIRST snapshot, where
+ * there is no local history to measure against. An unreadable directory is not
+ * assumed transient: only ENOENT is, because the owner may have just finished
+ * releasing. `Math.abs` so a clock-skewed far-FUTURE mtime is not read as
+ * recent forever. */
+function ownerlessLockLooksTransient(lock: string): boolean {
+  try { return Math.abs(Date.now() - statSync(lock).mtimeMs) <= OWNERLESS_LOCK_FRESH_MS; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+}
+
 function waitForCommitLockHandoff(
   lock: string,
   first: CommitLockAttempt,
   timeoutMs: number,
 ): boolean {
-  if (first.state !== "held-live" || first.ownerPid === process.pid) return false;
+  if (first.state === "held-live" && first.ownerPid === process.pid) return false;
+  // An owner-less FIRST snapshot is either a transient window (creation,
+  // release, lost reclaim race) or a stranded/legacy lock. Only the former is
+  // worth waiting for: a stranded lock must not block the capture for the whole
+  // handoff. This is the one place the directory's mtime is consulted.
+  if (first.state === "held-unknown" && !ownerlessLockLooksTransient(lock)) return false;
   const deadline = Date.now() + timeoutMs;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   let attempt: CommitLockAttempt = first;
+  // How long the lock has been CONTINUOUSLY owner-less, measured locally: a
+  // sighting of a live owner resets it, because a genuine release window lasts
+  // milliseconds. Reading it from this clock keeps the wait independent of the
+  // filesystem's mtime granularity and of other writers' clocks.
+  let ownerlessSince: number | null = first.state === "held-unknown" ? Date.now() : null;
+  // "Held" while the directory is not even there means mkdir keeps failing for a
+  // reason that is not contention — a missing, read-only or full store — and no
+  // amount of waiting will hand anything off. Require a short streak so one
+  // sample taken mid-release is not mistaken for it.
+  let vanishedStreak = 0;
   while (Date.now() < deadline) {
     if (attempt.state === "acquired") return true;
-    // Once the first snapshot proved a live owner, an owner-less snapshot can be
-    // the normal release window: recursive cleanup removes owner-<pid> before
-    // removing the outer lock directory. Keep the bounded handoff wait through
-    // that transient state instead of reporting a false busy/no-op result.
-    if (attempt.state === "held-live" && attempt.ownerPid === process.pid) return false;
+    if (attempt.state === "held-live") {
+      if (attempt.ownerPid === process.pid) return false;
+      ownerlessSince = null;
+      vanishedStreak = 0;
+    } else if (attempt.state === "held-unknown") {
+      ownerlessSince ??= Date.now();
+      if (Date.now() - ownerlessSince > OWNERLESS_LOCK_FRESH_MS) return false;
+      if (!existsSync(lock)) {
+        vanishedStreak += 1;
+        if (vanishedStreak >= 3) return false;
+      } else vanishedStreak = 0;
+    }
     Atomics.wait(sleeper, 0, 0, Math.min(25, deadline - Date.now()));
     attempt = acquireCommitLock(lock);
   }
