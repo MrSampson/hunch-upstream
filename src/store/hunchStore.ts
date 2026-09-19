@@ -12,7 +12,7 @@
  */
 import { resolve, join, dirname, isAbsolute, relative } from "node:path";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { toPosixTarget, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
+import { toPosixTarget, repoRelativeTarget, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
 import { ENTITY_KINDS, type Component, type Constraint, type Bug, type Decision, type Symbol, type Edge, type Finding, type RejectedTripwire, type EntityKind, type EntityFor, type TaskRecord } from "../core/types.js";
 import { openDb, withTx, type DB } from "./db.js";
 import { RESET_SQL, embedHash } from "./schema.js";
@@ -25,7 +25,7 @@ import {
   sameGitPublication,
   scopedLastChangeDates,
 } from "../extractors/git.js";
-import { pathMatchesGlob, pathsRelated } from "../core/glob.js";
+import { pathMatchesGlob, pathsRelated, isIndexedPath, matchSymbolsTiered } from "../core/glob.js";
 import { cochangeFor } from "../core/cochange.js";
 import { withServedDatabase } from "../core/served.js";
 import { normalizePath, rankTaskRecords, recordIdsOf, selectLatestTasks, selectTaskSlots, type RankingContext, type RankingQuery, type RankingWeights, type SlotOptions, type TaskSelection } from "../core/taskRanking.js";
@@ -1287,7 +1287,9 @@ export class HunchStore {
    *  instant — "what did we believe as of commit X?". Omit `asOf` for the full,
    *  history-inclusive view (backward-compatible default). */
   why(target: string, opts: { asOf?: string; canRead?: (record: unknown) => boolean } = {}): WhyResult {
-    target = toPosixTarget(target);
+    // An absolute target (an agent's edit-payload path, verbatim) never matched
+    // the repo-relative stored file paths below (issue #299).
+    target = repoRelativeTarget(target, this.paths.root);
     const decisions = this.recs("decisions").filter(opts.canRead ?? (() => true));
     const bugs = this.recs("bugs").filter(opts.canRead ?? (() => true));
     const constraints = this.recs("constraints").filter(opts.canRead ?? (() => true));
@@ -1298,13 +1300,26 @@ export class HunchStore {
     // pathsRelated, not bare endsWith: "scenario.ts".endsWith("io.ts") is true,
     // so an unanchored suffix pulled unrelated files' records into why()/the
     // pre-edit grounding block (issue #32). Segment-anchored matching only.
-    const matchedSymbols = symbols.filter((s) => s.file === target || s.name === target || s.id === target || pathsRelated(s.file, target));
+    //
+    // A target that IS a path Hunch's index already knows about (README.md,
+    // vscode-extension/index.ts, ...) names exactly one file — suffix-matching
+    // it too pulls in every OTHER file that merely shares a basename (issue
+    // #299: root index.ts delivered vscode-extension/index.ts's rules and vice
+    // versa). "Known to the index" is answered from already-loaded graph data
+    // (a symbol's exact file, or an indexed component's path glob — so a
+    // symbol-less real file still counts as real), never the filesystem: a
+    // deleted-but-still-indexed path must answer the same either way. Suffix
+    // matching stays reserved for a target that is not itself a real indexed
+    // path, e.g. a short/partial reference like "x/scenario.ts".
+    const indexed = isIndexedPath(target, symbols.map((s) => s.file), components.map((c) => c.paths));
+    const suffixMatch = (file: string) => !indexed && pathsRelated(file, target);
+    const matchedSymbols = matchSymbolsTiered(target, symbols, indexed);
     const symIds = new Set(matchedSymbols.map((s) => s.id));
     const fileSet = new Set(matchedSymbols.map((s) => s.file));
     const isPath = target.includes("/") || target.includes(".");
 
     const fileMatch = (files: string[]) =>
-      files.some((f) => f === target || (isPath && pathsRelated(f, target)) || fileSet.has(f));
+      files.some((f) => f === target || (isPath && suffixMatch(f)) || fileSet.has(f));
 
     return {
       target,
@@ -1549,6 +1564,10 @@ export class HunchStore {
    *  longer enforced. Pass `{ asOf }` to instead return the invariants in force at
    *  that instant (time-travel: "what must I not have broken as of commit X?"). */
   checkConstraints(scope: string, opts: { asOf?: string } = {}): Constraint[] {
+    // Constraint scopes are always repo-relative; an absolute target (an
+    // agent's edit-payload path, verbatim) matched nothing even when a
+    // blocking rule plainly applied (issue #296).
+    scope = repoRelativeTarget(scope, this.paths.root);
     const all = this.recs("constraints");
     const asOf = opts.asOf;
     return all
@@ -1563,13 +1582,19 @@ export class HunchStore {
    *  glob, and the queried scope may be either too. Advisory only — findings never
    *  enter any block path. Sorted worst-first, then id for stable output. */
   liveFindingsFor(scope: string): Finding[] {
-    const t = toPosixTarget(scope);
+    // Same absolute-target and same-basename-leak gaps as why() (issue #299): an
+    // un-rewritten absolute scope never matched the repo-relative `affected_files`
+    // below, and an un-guarded suffix fallback could pull in an unrelated file
+    // that merely shares a basename. Normalize once and reuse the same "is this
+    // path known to the index" guard.
+    const t = repoRelativeTarget(scope, this.paths.root);
+    const indexed = isIndexedPath(t, this.recs("symbols").map((s) => s.file), this.recs("components").map((c) => c.paths));
     const live = (f: Finding): boolean => f.triage === "open" || f.triage === "accepted-risk" || f.triage === "scheduled";
     return this.recs("findings")
       .filter(live)
       .filter((f) =>
-        f.affected_files.some((af) => pathMatchesGlob(t, af) || pathMatchesGlob(af, t) || pathsRelated(toPosixTarget(af), t))
-        || f.affected_symbols.some((s) => s === scope))
+        f.affected_files.some((af) => pathMatchesGlob(t, af) || pathMatchesGlob(af, t) || (!indexed && pathsRelated(toPosixTarget(af), t)))
+        || f.affected_symbols.some((s) => s === t))
       .sort((a, b) => (SEV_FINDING[b.severity] ?? 0) - (SEV_FINDING[a.severity] ?? 0) || a.id.localeCompare(b.id));
   }
 
@@ -1577,9 +1602,11 @@ export class HunchStore {
    *  denied edits), newest first. Graph memory, so it spans machines and survives
    *  the local ledger's retention window. */
   tasksFor(scope: string, limit = 8): TaskRecord[] {
-    const t = toPosixTarget(scope);
+    // Same normalization + indexed-suffix guard as liveFindingsFor/why() (issue #299).
+    const t = repoRelativeTarget(scope, this.paths.root);
+    const indexed = isIndexedPath(t, this.recs("symbols").map((s) => s.file), this.recs("components").map((c) => c.paths));
     return this.recs("tasks")
-      .filter((r) => r.files.some((f) => pathMatchesGlob(t, f) || pathMatchesGlob(f, t) || pathsRelated(toPosixTarget(f), t)))
+      .filter((r) => r.files.some((f) => pathMatchesGlob(t, f) || pathMatchesGlob(f, t) || (!indexed && pathsRelated(toPosixTarget(f), t))))
       .sort((a, b) => b.finished_at.localeCompare(a.finished_at) || a.id.localeCompare(b.id))
       .slice(0, Math.max(1, limit));
   }
@@ -2140,7 +2167,10 @@ export class HunchStore {
    *  a task on `target`, ordered by what matters most — invariants first, then the
    *  why, then blast radius and bug history — trimmed to a rough token budget. */
   assembleContext(target: string, budget = 1500, opts: { asOf?: string; canRead?: (record: unknown) => boolean } = {}): AssembledContext {
-    target = toPosixTarget(target);
+    // An absolute target (an agent's edit-payload path, verbatim) must be
+    // repo-relative BEFORE it reaches why()/liveFindingsFor() below, or an
+    // absolute path never matches the repo-relative stored data (issue #299).
+    target = repoRelativeTarget(target, this.paths.root);
     const w = this.why(target, opts);
     const symIds = w.symbols.map((s) => s.id);
     const blast = new Map<string, { id: string; depth: number; via: string }>();

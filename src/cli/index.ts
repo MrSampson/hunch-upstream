@@ -14,13 +14,13 @@
  *   doctor    environment diagnostics
  */
 import "./preflight.js"; // MUST stay the first import — Node-version gate before node:sqlite loads
-import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, rmdirSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, rmdirSync, symlinkSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join, relative, dirname, basename, resolve, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { hunchPaths, hunchPathsForDir, findRoot, toPosixTarget, isDir } from "../core/paths.js";
+import { hunchPaths, hunchPathsForDir, findRoot, toPosixTarget, isDir, realpathNorm, repoRelativeTarget } from "../core/paths.js";
 import { writeFileAtomic } from "../core/io.js";
 import { looksLikeCorrection, CORRECTION_NUDGE } from "../core/correction.js";
 import { HUNCH_VERSION } from "../core/version.js";
@@ -6803,27 +6803,17 @@ function readStdin(): Promise<string> {
 }
 
 /** Absolute edit path → repo-relative, forward-slash (constraint scopes are
- *  forward-slash globs even on Windows). */
-/** realpath a path even if it doesn't exist yet (a new file an agent is about to
- *  Write): resolve the longest existing ancestor, then re-append the missing tail.
- *  Idempotent on already-resolved paths. */
-function realpathNorm(p: string): string {
-  try {
-    return realpathSync.native(p);
-  } catch {
-    const parent = dirname(p);
-    if (parent === p) return p; // hit the root; nothing more to resolve
-    return join(realpathNorm(parent), basename(p));
-  }
-}
-
-/** Repo-relative POSIX path. BOTH ends are realpath-normalized first: on macOS
- *  `process.cwd()` (hence findRoot) resolves /var→/private/var, but a hook event's
- *  file_path arrives UN-resolved — so a naive relative() yields a bogus "../" path
- *  under any symlinked root (/var, /tmp, symlinked $HOME) and the caller treats the
- *  file as outside the repo, silently dropping all context (dec_e0a36efbf5). */
+ *  forward-slash globs even on Windows), or "" when `abs` isn't (resolvably)
+ *  inside `root`. Thin adapter over the shared `repoRelativeTarget` (core/paths.ts,
+ *  which realpath-normalizes both ends first — see its docstring for why, incl.
+ *  dec_e0a36efbf5): that function passes an unresolvable absolute path through
+ *  UNCHANGED (still absolute) rather than signaling failure directly, since other
+ *  callers want the original target back to fail their own match safely. This
+ *  adapter converts that "still absolute" signal to "" — the sentinel `onEdit`
+ *  and `editTargets` below already treat as "skip, not in this repo". */
 function toRepoRel(root: string, abs: string): string {
-  return relative(realpathNorm(root), realpathNorm(abs)).split("\\").join("/");
+  const rel = repoRelativeTarget(abs, root);
+  return isAbsolute(rel) || /^[a-zA-Z]:/.test(rel) ? "" : rel;
 }
 
 /** The in-repo files a pre-edit event would change, each with the lines the edit
