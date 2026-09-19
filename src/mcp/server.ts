@@ -14,7 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { hunchPaths, findRoot, toPosixTarget, repoRelativeTarget } from "../core/paths.js";
-import { isIndexedPath, matchSymbolsTiered } from "../core/glob.js";
+import { matchSymbolsTiered } from "../core/glob.js";
 import { resolveMcpToolset } from "./toolset.js";
 import { readConfig } from "../core/config.js";
 import { canonicalRootPath, resolveActiveRoot } from "./roots.js";
@@ -536,13 +536,16 @@ export function resolveSymbols(store: HunchStore, target: string): Symbol[] {
   target = repoRelativeTarget(target, store.publicRoot);
   const syms = store.json.loadAll("symbols");
   const components = store.json.loadAll("components");
-  // A target that IS a real indexed path (has a symbol, or is covered by an
-  // indexed component even with zero symbols — README.md, package.json, ...)
-  // never falls through to the suffix tier: bare `endsWith` matched unrelated
-  // files that merely end in the same characters — "db.ts" matched "mongodb.ts"
-  // (issue #300), and a same-basename file in another directory leaked its
-  // rules onto a real indexed target with no symbols of its own (issue #299).
-  const indexed = isIndexedPath(target, syms.map((s) => s.file), components.map((c) => c.paths));
+  // A target that IS a real path (has a symbol, is covered by an indexed
+  // component even with zero symbols — README.md, package.json, ... — or, last
+  // resort, is a real working-tree file the index cannot see at all, issue
+  // #334) never falls through to the suffix tier: bare `endsWith` matched
+  // unrelated files that merely end in the same characters — "db.ts" matched
+  // "mongodb.ts" (issue #300), and a same-basename file in another directory
+  // leaked its rules onto a real target with no symbols of its own (issue
+  // #299). `store.isKnownPath` is the one definition of that question; it is
+  // asked here over the PUBLIC graph only, matching the records resolved below.
+  const indexed = store.isKnownPath(target, { symbols: syms, components });
   return matchSymbolsTiered(target, syms, indexed);
 }
 

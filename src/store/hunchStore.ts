@@ -12,7 +12,7 @@
  */
 import { resolve, join, dirname, isAbsolute, relative } from "node:path";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { toPosixTarget, repoRelativeTarget, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
+import { toPosixTarget, repoRelativeTarget, isRepoFile, hunchPathsForDir, type HunchPaths } from "../core/paths.js";
 import { ENTITY_KINDS, type Component, type Constraint, type Bug, type Decision, type Symbol, type Edge, type Finding, type RejectedTripwire, type EntityKind, type EntityFor, type TaskRecord } from "../core/types.js";
 import { openDb, withTx, type DB } from "./db.js";
 import { RESET_SQL, embedHash } from "./schema.js";
@@ -1281,6 +1281,29 @@ export class HunchStore {
     return hits;
   }
 
+  /** The ONE definition of "is `t` a real path?" — the gate that decides whether a
+   *  target may fall through to segment-anchored suffix matching. Every matcher in
+   *  this file (and `resolveSymbols` in the MCP server) asks it exactly this way so
+   *  they cannot drift apart on the same question.
+   *
+   *  Graph data FIRST (a symbol's exact file, or an indexed component's path glob),
+   *  so a deleted-but-still-indexed path and a time-travel (`asOf`) query answer the
+   *  same as before (issue #299). The working tree is consulted only as a LAST
+   *  resort, for the case the index cannot see: a real file with zero tree-sitter
+   *  symbols and no covering component glob, which otherwise suffix-leaked an
+   *  unrelated same-basename file's records (issue #334). When the working tree is
+   *  unavailable or the file is gone, behaviour is exactly the pre-#334 behaviour.
+   *
+   *  `t` must already be repo-relative (`repoRelativeTarget`). `graph` lets a caller
+   *  that has already narrowed the graph (why()'s `canRead` visibility filter) ask
+   *  the question over exactly the records it may see, rather than all of them. */
+  isKnownPath(t: string, graph?: { symbols: readonly Symbol[]; components: readonly Component[] }): boolean {
+    const symbols = graph?.symbols ?? this.recs("symbols");
+    const components = graph?.components ?? this.recs("components");
+    return isIndexedPath(t, symbols.map((s) => s.file), components.map((c) => c.paths))
+      || isRepoFile(this.paths.root, t);
+  }
+
   /** All decisions/bugs/constraints/symbols/components touching a file path or
    *  symbol name (hunch_why). Pass `{ asOf }` (an ISO instant) to TIME-TRAVEL:
    *  return only decisions/constraints whose valid-time window contained that
@@ -1306,12 +1329,12 @@ export class HunchStore {
     // it too pulls in every OTHER file that merely shares a basename (issue
     // #299: root index.ts delivered vscode-extension/index.ts's rules and vice
     // versa). "Known to the index" is answered from already-loaded graph data
-    // (a symbol's exact file, or an indexed component's path glob — so a
-    // symbol-less real file still counts as real), never the filesystem: a
-    // deleted-but-still-indexed path must answer the same either way. Suffix
-    // matching stays reserved for a target that is not itself a real indexed
-    // path, e.g. a short/partial reference like "x/scenario.ts".
-    const indexed = isIndexedPath(target, symbols.map((s) => s.file), components.map((c) => c.paths));
+    // first (a symbol's exact file, or an indexed component's path glob — so a
+    // symbol-less indexed file still counts as real), and only then from the
+    // working tree, for a real file the index cannot see at all (issue #334).
+    // See isKnownPath. Suffix matching stays reserved for a target that is not
+    // itself a real path, e.g. a short/partial reference like "x/scenario.ts".
+    const indexed = this.isKnownPath(target, { symbols, components });
     const suffixMatch = (file: string) => !indexed && pathsRelated(file, target);
     const matchedSymbols = matchSymbolsTiered(target, symbols, indexed);
     const symIds = new Set(matchedSymbols.map((s) => s.id));
@@ -1449,12 +1472,13 @@ export class HunchStore {
   }
 
   /** Resolve a free-form target (symbol id / name / file path, component id / name)
-   *  to graph node ids — symbols win over components, exact file before suffix. */
+   *  to graph node ids — symbols win over components, exact file before suffix.
+   *  Shares why()/resolveSymbols' tiered matcher rather than one un-tiered SQL OR:
+   *  the flat query matched every tier at once, so a root `index.ts` also returned
+   *  `a/index.ts`'s symbols, and an absolute target matched nothing at all (#335). */
   resolveNodeIds(target: string): string[] {
-    const t = toPosixTarget(target);
-    const sym = this.db.prepare(
-      `SELECT id FROM symbols WHERE id = ? OR name = ? OR file = ? OR file LIKE ? LIMIT 20`,
-    ).all(t, t, t, `%/${t}`) as Array<{ id: string }>;
+    const t = repoRelativeTarget(target, this.paths.root);
+    const sym = matchSymbolsTiered(t, this.recs("symbols"), this.isKnownPath(t)).slice(0, 20);
     if (sym.length) return sym.map((r) => r.id);
     const cmp = this.db.prepare(`SELECT id FROM components WHERE id = ? OR name = ? LIMIT 5`).all(t, t) as Array<{ id: string }>;
     return cmp.map((r) => r.id);
@@ -1508,12 +1532,22 @@ export class HunchStore {
         dirs: [...dirs.entries()].map(([dir, v]) => ({ dir, ...v })).sort((a, b) => b.symbols - a.symbols),
       };
     }
-    const t = toPosixTarget(target.trim()).replace(/\/+$/, "");
+    // An absolute target (an agent's edit-payload path, verbatim) never matched the
+    // repo-relative stored file paths below and fell all the way to "none" (#335).
+    const t = repoRelativeTarget(target.trim(), this.paths.root).replace(/\/+$/, "");
     // FILE: exact path or unique suffix
     const fileRows = this.db.prepare(
       `SELECT id, name, kind, loc, fan_in, fan_out FROM symbols WHERE file = ? ORDER BY fan_in DESC, name`,
     ).all(t) as Array<{ id: string; name: string; kind: string; loc: number; fan_in: number; fan_out: number }>;
-    const fileHit = fileRows.length ? t : (this.db.prepare(`SELECT DISTINCT file FROM symbols WHERE file LIKE ?`).all(`%/${t}`) as Array<{ file: string }>).map((r) => r.file);
+    // Only the SUFFIX fallback is gated: a target that is itself a real path names
+    // exactly one file, so resolving it by suffix would serve an unrelated
+    // same-basename file's outline (#299/#334). Exact-path, directory and symbol
+    // tiers are untouched — a directory is deliberately not a "known path" here.
+    const fileHit = fileRows.length
+      ? t
+      : this.isKnownPath(t)
+        ? []
+        : (this.db.prepare(`SELECT DISTINCT file FROM symbols WHERE file LIKE ?`).all(`%/${t}`) as Array<{ file: string }>).map((r) => r.file);
     const file = typeof fileHit === "string" ? fileHit : fileHit.length === 1 ? fileHit[0]! : null;
     if (file) {
       const syms = fileRows.length ? fileRows : this.db.prepare(
@@ -1588,7 +1622,7 @@ export class HunchStore {
     // that merely shares a basename. Normalize once and reuse the same "is this
     // path known to the index" guard.
     const t = repoRelativeTarget(scope, this.paths.root);
-    const indexed = isIndexedPath(t, this.recs("symbols").map((s) => s.file), this.recs("components").map((c) => c.paths));
+    const indexed = this.isKnownPath(t);
     const live = (f: Finding): boolean => f.triage === "open" || f.triage === "accepted-risk" || f.triage === "scheduled";
     return this.recs("findings")
       .filter(live)
@@ -1602,9 +1636,9 @@ export class HunchStore {
    *  denied edits), newest first. Graph memory, so it spans machines and survives
    *  the local ledger's retention window. */
   tasksFor(scope: string, limit = 8): TaskRecord[] {
-    // Same normalization + indexed-suffix guard as liveFindingsFor/why() (issue #299).
+    // Same normalization + known-path suffix guard as liveFindingsFor/why() (issue #299).
     const t = repoRelativeTarget(scope, this.paths.root);
-    const indexed = isIndexedPath(t, this.recs("symbols").map((s) => s.file), this.recs("components").map((c) => c.paths));
+    const indexed = this.isKnownPath(t);
     return this.recs("tasks")
       .filter((r) => r.files.some((f) => pathMatchesGlob(t, f) || pathMatchesGlob(f, t) || (!indexed && pathsRelated(toPosixTarget(f), t))))
       .sort((a, b) => b.finished_at.localeCompare(a.finished_at) || a.id.localeCompare(b.id))

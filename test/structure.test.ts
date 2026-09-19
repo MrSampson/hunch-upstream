@@ -75,3 +75,44 @@ test("structure(symbol): exact definition site with one-hop neighbors; unknown �
   assert.ok(v.matches[0]!.callees.some((c) => c.includes("jwtDecode")), "callee side");
   assert.equal(store.structure("no_such_symbol_xyz").kind, "none");
 });
+
+/** A comment-only root `empty.ts` (zero tree-sitter symbols, no covering
+ *  component) beside `a/empty.ts` which HAS a function — the shape that fell
+ *  through structure()'s unique-suffix fallback and served the nested file's
+ *  outline for the root target (issue #334). Plus a root `index.ts` for the
+ *  absolute-target case (issue #335). */
+function indexedWithEmptyRootFile() {
+  const root = mkdtempSync(join(tmpdir(), "hunch-structure-real-"));
+  mkdirSync(join(root, "a"), { recursive: true });
+  writeFileSync(join(root, "empty.ts"), "// only a comment — no symbols at all\n");
+  writeFileSync(join(root, "a/empty.ts"), `export function nestedEmpty(){ return 1; }\n`);
+  writeFileSync(join(root, "index.ts"), `export function rootIndex(){ return 1; }\n`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+  return { store, root, cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+test("structure(): an absolute in-repo path resolves identically to its repo-relative form (issue #335)", (t) => {
+  const { store, root, cleanup } = indexedWithEmptyRootFile();
+  t.after(cleanup);
+  const rel = store.structure("index.ts");
+  const abs = store.structure(join(root, "index.ts"));
+  assert.equal(rel.kind, "file", "the relative form resolves to a file outline");
+  assert.deepEqual(abs, rel, "the absolute form must not fall through to kind:none");
+});
+
+test("structure(): a real root file with zero symbols must not serve a same-basename nested file's outline (issue #334)", (t) => {
+  const { store, cleanup } = indexedWithEmptyRootFile();
+  t.after(cleanup);
+  // "empty.ts" is a REAL working-tree file the index cannot see (no symbols, no
+  // covering component), so the unique-suffix fallback would have resolved it to
+  // "a/empty.ts". It must not.
+  const v = store.structure("empty.ts");
+  assert.notEqual(v.kind === "file" ? v.file : null, "a/empty.ts", "the root target must never resolve to the nested file");
+  // The nested file still resolves on its own exact path.
+  const nested = store.structure("a/empty.ts");
+  assert.equal(nested.kind, "file");
+  if (nested.kind === "file") assert.ok(nested.symbols.some((s) => s.name === "nestedEmpty"));
+});

@@ -73,7 +73,10 @@ export function pathsRelated(left: string, right: string): boolean {
  *  Dockerfile, ...) that has zero tree-sitter symbols but is still a real,
  *  known file. Derived entirely from already-loaded graph data — never the
  *  filesystem — so the answer doesn't depend on untracked working-tree state
- *  (a deleted-but-still-indexed path stays "real"; issue #299). */
+ *  (a deleted-but-still-indexed path stays "real"; issue #299). It is therefore
+ *  only HALF the "is this a real path" question: a real file with no symbols and
+ *  no covering component is invisible here, so callers OR in `isRepoFile` as a
+ *  last resort (issue #334) — `HunchStore.isKnownPath` is that composition. */
 export function isIndexedPath(
   target: string,
   symbolFiles: Iterable<string>,
@@ -85,11 +88,11 @@ export function isIndexedPath(
 }
 
 /** Resolve symbols matching `target`, tiered: exact id > exact name > exact file >
- *  (only when `target` is NOT a path already known to the index) segment-anchored
- *  suffix. A real indexed file with zero symbols must return [] rather than fall
- *  through to the suffix tier, which would leak an unrelated same-basename file's
- *  records (issue #299) — callers compute `indexed` via `isIndexedPath` first so
- *  the "is this a real path" question is answered identically everywhere. */
+ *  (only when `target` is NOT a path already known to be real) segment-anchored
+ *  suffix. A real file with zero symbols must return [] rather than fall through
+ *  to the suffix tier, which would leak an unrelated same-basename file's records
+ *  (issues #299/#334) — callers compute `indexed` via `HunchStore.isKnownPath`
+ *  first so the "is this a real path" question is answered identically everywhere. */
 export function matchSymbolsTiered<S extends { id: string; file: string; name: string }>(
   target: string,
   symbols: readonly S[],
