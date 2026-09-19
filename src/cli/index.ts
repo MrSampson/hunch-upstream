@@ -61,7 +61,7 @@ import type { Runbook } from "../core/types.js";
 import { extractInlineIntent } from "../extractors/comments.js";
 import { renderText, renderMarkdown, renderSarif, renderImpact, reportFailsStrict, type CheckReport, type SarifExtras } from "../core/checkreport.js";
 import { partitionReview, isReviewDraft, READY_MIN_GROUNDED, type ReviewItem } from "../core/reviewqueue.js";
-import { installPostCommitHook, installPreCommitHook, installPostMergeHook, installPostCheckoutHook, hookStatus, hookReport, formatHookInstall } from "../integrations/hooks.js";
+import { installPostCommitHook, installPreCommitHook, installPostMergeHook, installPostCheckoutHook, hookStatus, hookReport, hookInvocationLines, formatHookInstall } from "../integrations/hooks.js";
 import { ensureSharedOverlayPointer } from "../integrations/worktree.js";
 import { flushCapture, flushMemoryHome, flushMemoryHomes, pinSharedRemote, sharedRemoteFor, type MemoryHome } from "../integrations/sync.js";
 import { installMergeDriver } from "../integrations/mergeDriver.js";
@@ -527,8 +527,10 @@ program
     // the same way; do the same for the hook so an upgrade doesn't require
     // re-running init by hand. Gated on already having post-commit: `index`
     // is not a setup command (it runs in CI, on any git repo), so it must
-    // never be what FIRST hooks a repo that never ran init at all.
-    if (isGitRepo(root) && hookStatus(root).postCommit) {
+    // never be what FIRST hooks a repo that never ran init at all. A STALE
+    // post-commit block counts too (issue #315): it proves init ran, so the
+    // missing post-merge/post-checkout hooks are still this repo's to heal.
+    if (isGitRepo(root) && ["installed", "stale"].includes(hookReport(root).postCommit.state)) {
       const inv = resolveInvocation().shell;
       installPostMergeHook(root, inv);
       installPostCheckoutHook(root, inv); // same upgrade path for the workspace-ledger hook
@@ -6669,9 +6671,23 @@ program
       // hook manager's regenerated file — issue #311) is NOT installed.
       const unreachable = ([["post-commit", report.postCommit], ["post-merge", report.postMerge], ["pre-commit", report.preCommit], ["post-checkout", report.postCheckout]] as const)
         .filter(([, e]) => e.state === "unreachable");
+      // Present where git runs it, but its command is not a Hunch launcher that
+      // exists (hand-edited, or an absolute path gone after a reinstall) — issue #315.
+      const stale = ([["post-commit", report.postCommit], ["post-merge", report.postMerge], ["pre-commit", report.preCommit], ["post-checkout", report.postCheckout]] as const)
+        .filter(([, e]) => e.state === "stale");
+      // A bare `hunch init` regenerates post-commit without --private/--commit
+      // and pre-commit without --strict, so pointing at it without naming the
+      // options that keep them silently DOWNGRADES the install. --commit is left
+      // out: init's auto-commit is ON unless --no-auto-commit is passed, so a
+      // bare re-run keeps it and naming it here would claim a loss that never happens.
+      const carried = [...new Set(stale.flatMap(([, e]) => e.flags ?? []))].filter((f) => f !== "--commit");
+      const keep = carried.map((f) => (f === "--strict" ? "--enforce-strict" : f === "--private" ? "--private-sync (or --shared-sync)" : "")).filter(Boolean);
+      const staleKeep = carried.length
+        ? ` — the stale block carried ${carried.join(", ")}${keep.length ? `: pass ${keep.join(", ")} or they are dropped` : ""}`
+        : "";
       // `hunch index` only ever installs post-merge onto an existing
-      // post-commit install (it never hooks an un-hooked repo — see
-      // isGitRepo(root) && hookStatus(root).postCommit above) and never writes
+      // post-commit install (it never hooks an un-hooked repo — see the
+      // hookReport(root).postCommit.state gate above) and never writes
       // into a manager-owned hook — so the fix hint must not point there when
       // post-commit itself is missing or a hook manager is in play.
       const managedMissing = [report.postCommit, report.postMerge].find((e) => e.state === "missing" && e.manager !== "none");
@@ -6681,6 +6697,7 @@ program
       const problems = [
         missing.length ? `⚠ missing ${missing.join(", ")} — ${fix}` : "",
         unreachable.length ? `⚠ installed but unreachable: ${unreachable.map(([n]) => n).join(", ")} — never runs; run \`hunch init\` to print the snippet for your hook manager` : "",
+        stale.length ? `⚠ stale: ${stale.map(([n]) => n).join(", ")} — the hook's command is not a working Hunch launcher; run \`hunch init\` to regenerate it${staleKeep}` : "",
       ].filter(Boolean);
       console.log(`hooks:      ${problems.length
         ? problems.join("\n            ")
@@ -6688,6 +6705,12 @@ program
       for (const [name, e] of unreachable) {
         console.log(dim(`            ↳ ${name}: ${e.reason ?? "the block sits where git never reaches it"} (${rel(root, e.path)})`));
       }
+      for (const [name, e] of stale) {
+        console.log(dim(`            ↳ ${name}: ${e.reason ?? "the block's command is not a Hunch launcher"} (${rel(root, e.path)})`));
+      }
+      // Where the live hooks point — informational (a hook may legitimately run
+      // another install), but the fastest way to spot a stale/foreign launcher.
+      for (const line of hookInvocationLines(report, resolveInvocation().shell)) console.log(dim(`            ↳ ${line}`));
       // Workspace ledger: what this machine is called, whether its record is in memory,
       // and whether the checkout hook that keeps it fresh is installed.
       try {
@@ -6696,7 +6719,7 @@ program
         const others = store.recs("workspaces").filter((r) => r.machine.id !== machine.id).length;
         const leak = labelLeaksIdentity(machine.label);
         console.log(`workspaces: this machine is ${machine.label}${leak ? ` (⚠ label equals the ${leak})` : ""} · record in memory: ${stored ? `yes (${stored.observed_at})` : "no"} · ${others} other machine(s)` +
-          `${hooks.postCheckout ? " · post-checkout hook installed" : report.postCheckout.state === "unreachable" ? " · ⚠ post-checkout hook unreachable" : hooks.postCommit ? " · post-checkout hook not installed (`hunch index` adds it)" : ""}`);
+          `${hooks.postCheckout ? " · post-checkout hook installed" : report.postCheckout.state === "unreachable" ? " · ⚠ post-checkout hook unreachable" : report.postCheckout.state === "stale" ? " · ⚠ post-checkout hook stale" : hooks.postCommit ? " · post-checkout hook not installed (`hunch index` adds it)" : ""}`);
       } catch { /* no machine file writable: nothing to report */ }
     }
     // In unified mode the public .hunch directory is only a routing shell.

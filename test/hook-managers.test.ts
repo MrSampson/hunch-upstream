@@ -188,7 +188,7 @@ test("pre-commit framework migration mode: a reachable block in <hook>.legacy co
   const r = repo();
   try {
     writeFileSync(join(r, ".git", "hooks", "post-commit"), preCommitFrameworkHook("post-commit"));
-    writeFileSync(join(r, ".git", "hooks", "post-commit.legacy"), "#!/bin/sh\n# >>> hunch post-commit >>>\nhunch sync\n# <<< hunch post-commit <<<\n");
+    writeFileSync(join(r, ".git", "hooks", "post-commit.legacy"), "#!/bin/sh\n# >>> hunch post-commit >>>\nhunch sync --from-hook --quiet\n# <<< hunch post-commit <<<\n");
     assert.equal(hookReport(r).postCommit.state, "installed");
     assert.equal(installPostCommitHook(r, "hunch").action, "unchanged");
   } finally { rmSync(r, { recursive: true, force: true }); }
@@ -231,6 +231,36 @@ test("husky v9: nothing is appended to .husky/_ (dead after exit $c, regenerated
     assert.equal(hookStatus(r).postMerge, true);
     assert.equal(installPostCommitHook(r, LOCAL_INV).action, "unchanged");
     assert.equal(installPostMergeHook(r, LOCAL_INV).action, "unchanged");
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+test("husky v9: a reachable block in husky's own script whose launcher is gone is stale, and the install says to replace it", () => {
+  const r = repo();
+  try {
+    huskyV9(r);
+    // Reachable (husky's own script), but the absolute launcher it points at is
+    // gone after a reinstall — never executed here, only read.
+    const dead = join(r, "gone", "bin", "hunch");
+    writeFileSync(join(r, ".husky", "post-commit"), `# >>> hunch post-commit >>>\n${dead} sync --from-hook --quiet\n# <<< hunch post-commit <<<\n`);
+    const report = hookReport(r);
+    assert.equal(report.postCommit.state, "stale");
+    assert.equal(hookStatus(r).postCommit, false);
+
+    const res = installPostCommitHook(r, "hunch");
+    assert.equal(res.action, "managed-elsewhere");
+    assert.match(res.reason ?? "", /stale/, "a stale block must not be reported as 'a hook manager owns this hook'");
+    assert.ok(res.snippet?.includes(PORTABLE_HOOK_INVOCATION));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+test("husky v9: a block in husky's own script run through a package runner is installed, and re-installing leaves it alone", () => {
+  const r = repo();
+  try {
+    huskyV9(r);
+    writeFileSync(join(r, ".husky", "post-commit"), "# >>> hunch post-commit >>>\npnpm exec hunch sync --from-hook --quiet\n# <<< hunch post-commit <<<\n");
+    assert.equal(hookReport(r).postCommit.state, "installed");
+    assert.equal(hookStatus(r).postCommit, true);
+    assert.equal(installPostCommitHook(r, "hunch").action, "unchanged");
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
 
@@ -335,12 +365,13 @@ test("plain .git/hooks: an existing Hunch block after exec is unreachable; one b
   const r = repo();
   try {
     const hookPath = join(r, ".git", "hooks", "post-commit");
-    writeFileSync(hookPath, "#!/bin/sh\nexec ./other-hook\n# >>> hunch post-commit >>>\nhunch sync\n# <<< hunch post-commit <<<\n");
+    writeFileSync(hookPath, "#!/bin/sh\nexec ./other-hook\n# >>> hunch post-commit >>>\nhunch sync --from-hook --quiet\n# <<< hunch post-commit <<<\n");
     assert.equal(hookReport(r).postCommit.state, "unreachable");
     assert.equal(hookStatus(r).postCommit, false);
     assert.equal(installPostCommitHook(r, "hunch").action, "unreachable");
 
-    writeFileSync(hookPath, "#!/bin/sh\n# >>> hunch post-commit >>>\nold\n# <<< hunch post-commit <<<\nexit 0\n");
+    // An older (but still working) invocation before the exit: reachable, live, updated in place.
+    writeFileSync(hookPath, "#!/bin/sh\n# >>> hunch post-commit >>>\nhunch sync --from-hook\n# <<< hunch post-commit <<<\nexit 0\n");
     assert.equal(hookReport(r).postCommit.state, "installed");
     assert.equal(installPostCommitHook(r, "hunch").action, "updated");
     const text = readFileSync(hookPath, "utf8");

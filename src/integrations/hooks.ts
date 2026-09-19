@@ -16,6 +16,7 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, isAbsolute, dirname, basename, relative, resolve } from "node:path";
+import { homedir } from "node:os";
 import { hooksDir, gitCommonDir } from "../extractors/git.js";
 import { initiatorChildEnv } from "../synthesis/initiator.js";
 import { HUNCH_NPX_PACKAGE_SPEC } from "../core/version.js";
@@ -80,6 +81,9 @@ export interface HookInstall {
   reason?: string;
   /** What to add to `path` by hand (non-writing actions only). */
   snippet?: string;
+  /** The file already carries a Hunch block, but a dead one: the snippet
+   *  REPLACES it rather than being added (non-writing actions only). */
+  stale?: boolean;
 }
 
 function escapeRe(s: string): string {
@@ -253,27 +257,229 @@ function preCommitId(mark: string): string {
   } as Record<string, string>)[mark] ?? "hunch";
 }
 
-type BlockState = "installed" | "unreachable" | "missing";
+type BlockState = "installed" | "unreachable" | "stale" | "missing";
 
-/** Whether our block for `mark` is present where git will actually run it. */
-function blockState(t: HookTarget, mark: string): BlockState {
+/** The result of inspecting the command a managed block actually runs (issue #315). */
+export type HookInvocationHealth =
+  | { ok: true; invocation: string }
+  | { ok: false; invocation: string; reason: string };
+
+const ENV_ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=\S*$/;
+const UNQUOTED_META = /[;|&$`<>()]/;
+const LAUNCHER_EXT = /\.(?:exe|cmd|bat|ps1)$/;
+const HUNCH_ENTRY = /\/cli\/index\.(?:js|ts)$/;
+
+/** Split an invocation into simple shell words. Hunch writes its own paths with
+ *  JSON.stringify, so a double-quoted token decodes with JSON.parse. Anything a
+ *  shell would treat as more than a plain command (metacharacters, expansions,
+ *  an unterminated quote) yields null — we refuse to guess. */
+function shellWords(s: string): string[] | null {
+  const out: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i]!;
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '"' || c === "'") {
+      const end = s.indexOf(c, i + 1);
+      if (end < 0) return null;
+      const raw = s.slice(i, end + 1);
+      if (c === '"') {
+        if (/[$`]/.test(raw)) return null;
+        try { out.push(JSON.parse(raw) as string); } catch { return null; }
+      } else out.push(raw.slice(1, -1));
+      i = end + 1;
+      continue;
+    }
+    let j = i;
+    while (j < s.length && !/\s/.test(s[j]!)) j++;
+    const word = s.slice(i, j);
+    if (UNQUOTED_META.test(word)) return null;
+    out.push(word);
+    i = j;
+  }
+  return out;
+}
+
+/** The launcher's own name: last path segment, lower-cased, without a Windows
+ *  executable extension — so `/usr/local/bin/hunch`, `hunch.cmd` and `hunch` all match. */
+function base(tok: string): string {
+  return (tok.split(/[\\/]/).at(-1) ?? "").toLowerCase().replace(LAUNCHER_EXT, "");
+}
+
+function isAbs(tok: string): boolean {
+  return isAbsolute(tok) || /^[A-Za-z]:[\\/]/.test(tok);
+}
+
+function isPathish(tok: string): boolean {
+  return tok.includes("/") || tok.includes("\\") || isAbs(tok);
+}
+
+function pathExists(tok: string, root: string): boolean {
+  // A hand-written hook may spell this machine's install as `~/…`; the shell
+  // expands it, so we must too before asking the filesystem.
+  const path = tok === "~" ? homedir() : tok.startsWith("~/") ? join(homedir(), tok.slice(2)) : tok;
+  return existsSync(isAbs(path) ? path : resolve(root, path));
+}
+
+const NOT_OURS = "not a command Hunch writes";
+
+/** Whether the command in front of a managed block's subcommand is a Hunch
+ *  launcher that could actually run (issue #315): a block whose command was
+ *  hand-edited into something else, or whose absolute node/CLI path no longer
+ *  exists after a reinstall, is present but dead. `command` is the text BEFORE
+ *  the subcommand; env assignments and a leading `(` belong to the block's own
+ *  shape and are stripped. Never spawns anything, never touches the network. */
+export function hookInvocationHealth(command: string, root: string): HookInvocationHealth {
+  let rest = command.trim().replace(/^\(\s*/, "");
+  for (;;) {
+    const m = /^(\S+)\s+/.exec(rest);
+    if (!m || !ENV_ASSIGN.test(m[1]!)) break;
+    rest = rest.slice(m[0].length);
+  }
+  const invocation = rest.trim();
+  const bad = (reason: string): HookInvocationHealth => ({ ok: false, invocation, reason });
+  const toks = shellWords(invocation);
+  if (toks === null || toks.length === 0) return bad(NOT_OURS);
+
+  const [head, ...rest2] = toks as [string, ...string[]];
+  const missing = (tok: string) => `${tok} does not exist`;
+  // `<runtime> <script…>`: every non-flag token after the runtime is a script
+  // path (`<node> <cli>`, or tsx's `<node> <tsx> <cli>`) — a runtime flag like
+  // `--no-warnings` is not a path, but a runtime with no script at all is not ours.
+  const runtime = (): HookInvocationHealth => {
+    if (isPathish(head) && !pathExists(head, root)) return bad(missing(head));
+    const scripts = rest2.filter((t) => !t.startsWith("-"));
+    if (scripts.length === 0) return bad(NOT_OURS);
+    const gone = scripts.find((t) => !pathExists(t, root));
+    return gone === undefined ? { ok: true, invocation } : bad(missing(gone));
+  };
+  switch (base(head)) {
+    case "hunch":
+      if (rest2.length > 0) return bad(NOT_OURS);
+      if (isPathish(head) && !pathExists(head, root)) return bad(missing(head));
+      return { ok: true, invocation };
+    case "node":
+      return rest2.length === 0 ? bad(NOT_OURS) : runtime();
+    case "npx":
+    case "pnpm":
+    case "yarn":
+    case "bunx":
+    case "npm":
+    case "env": {
+      // A package runner in front of the launcher: `npx -y --package=…@x.y.z hunch`
+      // (PORTABLE_HOOK_INVOCATION), `npx hunch`, and the shapes users adapt the
+      // snippet into by hand (`pnpm exec hunch`, `yarn run hunch`, `npm exec --
+      // hunch`, `env X=1 hunch`). What the runner would resolve is never verified —
+      // doing so would mean a network install — so only the launcher it ends in is read.
+      const args = rest2.filter((t) => !t.startsWith("-"));
+      const last = args.at(-1);
+      if (last !== undefined && (base(last) === "hunch" || /^@davesheffer\/hunch(?:@\S+)?$/.test(last))) return { ok: true, invocation };
+      const tsx = args.indexOf("tsx");
+      if (tsx >= 0 && args.length === tsx + 2) {
+        return pathExists(args[tsx + 1]!, root) ? { ok: true, invocation } : bad(missing(args[tsx + 1]!));
+      }
+      return bad(NOT_OURS);
+    }
+    default:
+      // `resolveInvocation` writes process.execPath, which is not always named
+      // `node` (Debian's `nodejs`, a version-suffixed binary). Any other runtime
+      // is ours only as an absolute path running Hunch's own CLI entry — else
+      // `hunch init` would rewrite the same block and doctor would call it stale forever.
+      return isAbs(head) && rest2.length > 0 && HUNCH_ENTRY.test(rest2.at(-1)!.replace(/\\/g, "/")) ? runtime() : bad(NOT_OURS);
+  }
+}
+
+/** The command each managed block runs, keyed by mark. Resolved inside a
+ *  function (like `preCommitId`) because the marks are declared further down. */
+function blockSubcommand(mark: string): { re: RegExp; words: string } {
+  return ({
+    [MARK]: { re: /(?:^|\s)sync\s+--from-hook\b/, words: "sync --from-hook" },
+    [PRE_MARK]: { re: /(?:^|\s)check\s+--staged\b/, words: "check --staged" },
+    [GROUNDING_MERGE_MARK]: { re: /(?:^|\s)grounding\s+--refresh\b/, words: "grounding --refresh" },
+    [REPAIR_MERGE_MARK]: { re: /(?:^|\s)repair-provenance\b/, words: "repair-provenance" },
+    [CHECKOUT_MARK]: { re: /(?:^|\s)workspaces\s+snapshot\b/, words: "workspaces snapshot" },
+  } as Record<string, { re: RegExp; words: string }>)[mark] ?? { re: /(?:^|\s)hunch\b/, words: "hunch" };
+}
+
+/** Hunch's OWN option flags a block's command line may carry after the
+ *  subcommand — the ones `hunch init` decides from its options, so a regenerated
+ *  block silently drops any the re-run does not ask for again. Fixed set, in a
+ *  stable order; anything else on the line is not ours to report. */
+const BLOCK_FLAGS = ["--private", "--commit", "--strict"] as const;
+
+function blockFlags(line: string): string[] {
+  return BLOCK_FLAGS.filter((f) => new RegExp(`(?:^|\\s)${escapeRe(f)}(?=\\s|$)`).test(line));
+}
+
+/** A block's health plus Hunch's own option flags the reported line carried
+ *  after the subcommand (an intersection: the health stays a discriminated union). */
+type BlockInspection = HookInvocationHealth & { flags: string[] };
+
+/** Inspect the command inside `mark`'s block in `file`: the block body is the
+ *  lines between the mark and the closing marker. A block may legitimately carry
+ *  several command lines (or a hand-added one); any working line makes it live. */
+function inspectBlock(file: string, mark: string, root: string): BlockInspection {
+  const { re, words } = blockSubcommand(mark);
+  const text = readText(file) ?? "";
+  const at = text.indexOf(mark);
+  const body = at < 0 ? [] : text.slice(at).replace(/\r/g, "").split("\n").slice(1);
+  let first: BlockInspection | null = null;
+  for (const line of body) {
+    if (/^# <<< hunch /.test(line)) break;
+    if (line.trim().startsWith("#")) continue;
+    const m = re.exec(line);
+    if (!m) continue;
+    // Flags belong to the SUBCOMMAND, so they are read from the text after it.
+    const health = { ...hookInvocationHealth(line.slice(0, m.index), root), flags: blockFlags(line.slice(m.index)) };
+    if (health.ok) return health;
+    first ??= health;
+  }
+  return first ?? { ok: false, invocation: "", reason: `the block has no \`hunch ${words}\` command`, flags: [] };
+}
+
+interface BlockInfo {
+  state: BlockState;
+  /** Where the block's command points (empty when there is no command to read). */
+  invocation?: string;
+  /** Why a `stale` block's command could never do its job. */
+  staleReason?: string;
+  /** Hunch's own option flags the block's command carried (see BLOCK_FLAGS). */
+  flags?: string[];
+  /** The file the block was read from. */
+  file: string;
+}
+
+/** Whether our block for `mark` is present where git will actually run it AND
+ *  its command is a Hunch launcher that exists (issue #315 — a marker alone
+ *  proves nothing about what the block does). */
+function blockInfo(t: HookTarget, mark: string, root: string): BlockInfo {
   const inHook = markerState(t.hookPath, mark);
+  // A reachable marker only earns "installed" once its command checks out.
+  const live = (file: string): BlockInfo => {
+    const health = inspectBlock(file, mark, root);
+    return health.ok
+      ? { state: "installed", invocation: health.invocation, flags: health.flags, file }
+      : { state: "stale", invocation: health.invocation, staleReason: health.reason, flags: health.flags, file };
+  };
   switch (t.manager) {
     case "none":
-      return inHook === "reachable" ? "installed" : inHook === "unreachable" ? "unreachable" : "missing";
+      return inHook === "reachable" ? live(t.hookPath) : { state: inHook === "unreachable" ? "unreachable" : "missing", file: t.hookPath };
     case "husky":
-      if (markerState(t.ownerFile, mark) === "reachable") return "installed";
-      if (markerState(t.ownerFile, mark) === "unreachable" || inHook !== "absent") return "unreachable";
-      return "missing";
+      if (markerState(t.ownerFile, mark) === "reachable") return live(t.ownerFile);
+      if (markerState(t.ownerFile, mark) === "unreachable" || inHook !== "absent") return { state: "unreachable", file: t.hookPath };
+      return { state: "missing", file: t.ownerFile };
     case "pre-commit": {
       const config = readText(t.ownerFile);
-      if (config !== null && new RegExp(`\\bid:\\s*["']?${escapeRe(preCommitId(mark))}["']?\\s*$`, "m").test(config)) return "installed";
+      // The framework's own config carries the command in its own format; the
+      // `id:` is the contract, so it is taken at face value.
+      if (config !== null && new RegExp(`\\bid:\\s*["']?${escapeRe(preCommitId(mark))}["']?\\s*$`, "m").test(config)) return { state: "installed", file: t.ownerFile };
       // Migration mode: `pre-commit install` moved the previous hook to <hook>.legacy and runs it first.
-      if (markerState(`${t.hookPath}.legacy`, mark) === "reachable") return "installed";
-      return inHook !== "absent" ? "unreachable" : "missing";
+      const legacy = `${t.hookPath}.legacy`;
+      if (markerState(legacy, mark) === "reachable") return live(legacy);
+      return inHook !== "absent" ? { state: "unreachable", file: t.hookPath } : { state: "missing", file: t.ownerFile };
     }
     default: // husky-legacy, tracked-hooks-path, exec-exit: the hook file itself
-      return inHook === "reachable" ? "installed" : inHook === "unreachable" ? "unreachable" : "missing";
+      return inHook === "reachable" ? live(t.hookPath) : { state: inHook === "unreachable" ? "unreachable" : "missing", file: t.hookPath };
   }
 }
 
@@ -317,13 +523,20 @@ function snippetFor(t: HookTarget, mark: string, build: BlockBuilder, localInvoc
 function installManagedBlock(root: string, hookName: string, mark: string, end: string, build: BlockBuilder, invocation: string): HookInstall {
   const t = resolveHookTarget(root, hookName, mark);
   if (t.manager !== "none") {
-    if (blockState(t, mark) === "installed") return { path: t.ownerFile, action: "unchanged", manager: t.manager };
+    const info = blockInfo(t, mark, root);
+    if (info.state === "installed") return { path: t.ownerFile, action: "unchanged", manager: t.manager };
     return {
       path: t.ownerFile,
       action: t.manager === "exec-exit" ? "unreachable" : "managed-elsewhere",
       manager: t.manager,
-      reason: t.reason,
+      // A stale block IS reachable — the manager's file already carries one, it
+      // just cannot run. Saying "a hook manager owns this hook" would send the
+      // user looking for a block that is right there (issue #315).
+      reason: info.state === "stale"
+        ? `the Hunch block in ${basename(info.file)} is stale (${info.staleReason ?? "its command is not a Hunch launcher"}) — replace it with the snippet below`
+        : t.reason,
       snippet: snippetFor(t, mark, build, invocation),
+      ...(info.state === "stale" ? { stale: true } : {}),
     };
   }
 
@@ -479,8 +692,13 @@ export interface HookReportEntry {
   manager: HookManagerKind;
   /** The file where the block lives (or should live). */
   path: string;
-  /** Why an `unreachable` block never runs. */
+  /** Why an `unreachable` block never runs, or why a `stale` one could not work. */
   reason?: string;
+  /** Where the hook points: the distinct invocations of its marks' blocks. */
+  invocation?: string;
+  /** Hunch's own option flags the hook's blocks carry (`--private`, `--commit`,
+   *  `--strict`) — what a plain `hunch init` re-run would drop. Omitted when none. */
+  flags?: string[];
 }
 export interface HookReport {
   postCommit: HookReportEntry;
@@ -492,23 +710,34 @@ export interface HookReport {
 function reportEntry(root: string, hookName: string, marks: string[]): HookReportEntry {
   const states = marks.map((mark) => {
     const t = resolveHookTarget(root, hookName, mark);
-    return { t, state: blockState(t, mark) };
+    return { t, ...blockInfo(t, mark, root) };
   });
   const unreachable = states.find((s) => s.state === "unreachable");
-  const pick = unreachable ?? states.find((s) => s.state === "missing") ?? states[0];
+  const stale = states.find((s) => s.state === "stale");
+  // A dead block outranks a stale one, which outranks a missing one: each is a
+  // stronger statement about why this hook is not doing its job.
+  const pick = unreachable ?? stale ?? states.find((s) => s.state === "missing") ?? states[0];
   if (!pick) throw new Error("reportEntry needs at least one marker");
-  const state: HookState = unreachable ? "unreachable" : states.every((s) => s.state === "installed") ? "installed" : "missing";
+  const state: HookState = unreachable ? "unreachable" : stale ? "stale" : states.every((s) => s.state === "installed") ? "installed" : "missing";
+  const invocation = [...new Set(states.map((s) => s.invocation).filter((i): i is string => !!i))].join(" · ");
+  // Union across the hook's marks, in BLOCK_FLAGS order — a hook is re-installed
+  // as a whole, so a flag on any of its blocks is one a bare re-run would drop.
+  const flags = BLOCK_FLAGS.filter((f) => states.some((s) => s.flags?.includes(f)));
   return {
     state,
     manager: pick.t.manager,
-    path: state === "unreachable" && pick.t.manager !== "husky" ? pick.t.hookPath : pick.t.ownerFile,
-    ...(state === "unreachable" ? { reason: pick.t.reason } : {}),
+    path: state === "unreachable" && pick.t.manager !== "husky" ? pick.t.hookPath : state === "stale" ? pick.file : pick.t.ownerFile,
+    ...(state === "unreachable" ? { reason: pick.t.reason } : state === "stale" ? { reason: pick.staleReason } : {}),
+    ...(invocation ? { invocation } : {}),
+    ...(flags.length ? { flags } : {}),
   };
 }
 
 /** Read-only diagnostic (used by `hunch doctor`): each managed hook's state —
- *  `installed` (present where git will run it), `unreachable` (present, but
- *  after an exec/exit or in a manager-owned file git never reaches), or
+ *  `installed` (present where git will run it, running a Hunch launcher that
+ *  exists), `unreachable` (present, but after an exec/exit or in a
+ *  manager-owned file git never reaches), `stale` (present where git runs it,
+ *  but its command is not a working Hunch launcher — issue #315), or
  *  `missing`. postMerge requires BOTH halves (grounding-refresh and
  *  repair-provenance) — a repo carrying only one is a partial install, same as
  *  `installPostMergeHook` self-healing it. Never writes anything. */
@@ -522,9 +751,9 @@ export function hookReport(root: string): HookReport {
 }
 
 /** Boolean view of `hookReport`: a hook counts as installed only when its
- *  managed block is present where git will actually run it, regardless of
- *  whether the invocation inside it happens to be stale. An unreachable block
- *  (issue #311) is NOT installed. */
+ *  managed block is present where git will actually run it AND the command
+ *  inside it is a Hunch launcher that exists. An unreachable block (issue #311)
+ *  and a stale one (issue #315) are both NOT installed. */
 export function hookStatus(root: string): { postCommit: boolean; preCommit: boolean; postMerge: boolean; postCheckout: boolean } {
   const r = hookReport(root);
   return {
@@ -535,6 +764,19 @@ export function hookStatus(root: string): { postCommit: boolean; preCommit: bool
   };
 }
 
+/** Doctor lines for where each installed/stale hook points (issue #315): hooks
+ *  sharing one invocation share one line, and a line whose invocation is not the
+ *  Hunch currently running says so. Informational — a hook may legitimately
+ *  point at a different install. Pure; the caller adds indentation and dim(). */
+export function hookInvocationLines(report: HookReport, running: string): string[] {
+  const named = ([["post-commit", report.postCommit], ["post-merge", report.postMerge], ["pre-commit", report.preCommit], ["post-checkout", report.postCheckout]] as const)
+    .filter(([, e]) => e.invocation && (e.state === "installed" || e.state === "stale"));
+  const grouped = new Map<string, string[]>();
+  for (const [name, e] of named) grouped.set(e.invocation!, [...(grouped.get(e.invocation!) ?? []), name]);
+  return [...grouped].map(([inv, names]) =>
+    `${names.join(", ")} → ${inv}${running && inv !== running ? ` (differs from the running Hunch: ${running})` : ""}`);
+}
+
 /** CLI lines for one install result: the usual ✓ line when the block is in a
  *  file git runs, otherwise a warning with the reason and the snippet to add to
  *  the manager's own file. */
@@ -543,7 +785,9 @@ export function formatHookInstall(root: string, label: string, h: HookInstall, d
   const shown = isInside(root, h.path) ? relative(realish(root), realish(h.path)).replace(/\\/g, "/") : h.path;
   return [
     `  ⚠ ${label} NOT installed — ${h.reason ?? "a hook manager owns this hook"}`,
-    `    add this to ${shown} yourself:`,
+    // A stale block is already there and the reason said to replace it; anything
+    // else is missing and has to be added.
+    `    ${h.stale ? "replace the Hunch block in" : "add this to"} ${shown} yourself:`,
     ...(h.snippet ?? "").split("\n").map((l) => `      ${l}`),
   ];
 }
