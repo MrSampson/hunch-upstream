@@ -6,8 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hunchPaths } from "../src/core/paths.js";
 import { HunchStore } from "../src/store/hunchStore.js";
-import { indexRepo } from "../src/extractors/indexer.js";
+import { indexRepo, isExtractorEdge, mergeScannedEdges } from "../src/extractors/indexer.js";
 import { pathMatchesGlob } from "../src/core/glob.js";
+import { edgeId, resourceId, resourceRelationshipId } from "../src/core/ids.js";
+import { EdgeSchema, RESOURCE_RELATIONSHIP_SCHEMA_VERSION, extracted } from "../src/core/types.js";
 import { SYMLINK_SKIP, indexedFixtureStore, seedRootLevelFileFixture } from "./helpers.js";
 
 function fixtureRepo(): string {
@@ -1677,4 +1679,103 @@ test("root-level indexed files get exact-match component paths, not a match-ever
     assert.ok(pathMatchesGlob("settings.ts", p) === (p === "settings.ts"));
     assert.ok(!pathMatchesGlob("src/auth/session.ts", p));
   }
+});
+
+test("reindex keeps supersedes edges and reviewed relationships (#288)", () => {
+  const root = fixtureRepo();
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  const first = indexRepo(store, root, { churn: false });
+  const extractorEdgesBefore = store.json.loadAll("edges").filter(isExtractorEdge).length;
+  assert.ok(extractorEdgesBefore > 0, "the fixture yields extractor edges");
+  assert.equal(extractorEdgesBefore, first.edges, "the scan count covers exactly the extractor edges");
+
+  // shaped exactly like supersedeIn writes it (src/store/hunchStore.ts)
+  const supersedes = EdgeSchema.parse({
+    schema: "hunch.edge/1",
+    id: edgeId("dec_new", "dec_old", "supersedes"),
+    from: "dec_new",
+    to: "dec_old",
+    type: "supersedes",
+    reason: "dec_new supersedes dec_old",
+    strength: 1,
+    provenance: { source: "derived", confidence: 1, evidence: ["dec_new", "dec_old"] },
+    environment: null,
+    metadata: {},
+  });
+  store.json.put("edges", supersedes);
+
+  // a human-reviewed Landscape relationship, as `hunch landscape adopt` writes it
+  const repositoryId = resourceId("repository", "https://github.com/acme/payments");
+  const apiId = resourceId("api", "openapi.yaml");
+  const relationship = EdgeSchema.parse({
+    schema: RESOURCE_RELATIONSHIP_SCHEMA_VERSION,
+    id: resourceRelationshipId(repositoryId, apiId, "contains"),
+    from: repositoryId,
+    to: apiId,
+    type: "contains",
+    reason: "repository declares API",
+    strength: 1,
+    provenance: { source: "extracted:api-declaration", confidence: 0.9, evidence: ["openapi.yaml"] },
+    currentness: { status: "unverified", source_revision: "deadbeef" },
+    environment: null,
+    metadata: { discovery_authority: "reviewed" },
+  });
+  store.json.put("edges", relationship);
+
+  indexRepo(store, root, { churn: false });
+
+  const after = store.json.loadAll("edges");
+  assert.deepEqual(after.find((e) => e.id === supersedes.id), supersedes, "supersedes edge survives reindex");
+  assert.deepEqual(after.find((e) => e.id === relationship.id), relationship, "reviewed relationship survives reindex");
+  assert.equal(after.filter(isExtractorEdge).length, extractorEdgesBefore, "every extractor edge is still there");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("reindex still drops stale extractor edges", () => {
+  const root = fixtureRepo();
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+
+  const stale = store.json.loadAll("edges").find((e) => isExtractorEdge(e) && e.reason.includes("charge"));
+  assert.ok(stale, "charge -> verifySession edge indexed on the first pass");
+
+  rmSync(join(root, "src/billing/charge.ts"));
+  indexRepo(store, root, { churn: false });
+
+  assert.equal(
+    store.json.loadAll("edges").find((e) => e.id === stale.id),
+    undefined,
+    "an extractor edge whose source is gone is not carried forward",
+  );
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("mergeScannedEdges keeps the carried edge on an id collision", () => {
+  const carried = EdgeSchema.parse({
+    schema: "hunch.edge/1",
+    id: edgeId("a", "b", "supersedes"),
+    from: "a", to: "b", type: "supersedes",
+    reason: "carried", strength: 1,
+    provenance: { source: "derived", confidence: 1, evidence: [] },
+    environment: null, metadata: {},
+  });
+  const collidingScan = { ...carried, reason: "scanned", provenance: extracted(0.8, ["src/a.ts"]) };
+  const freshScan = EdgeSchema.parse({
+    schema: "hunch.edge/1",
+    id: edgeId("c", "d", "calls"),
+    from: "c", to: "d", type: "calls",
+    reason: "c calls d", strength: 0.8,
+    provenance: extracted(0.8, ["src/a.ts"]),
+    environment: null, metadata: {},
+  });
+
+  const merged = mergeScannedEdges([carried], [collidingScan, freshScan]);
+  assert.deepEqual(merged, [carried, freshScan], "the carried edge wins, the non-colliding scan is appended");
+  assert.equal(new Set(merged.map((e) => e.id)).size, merged.length, "no duplicate ids");
 });
