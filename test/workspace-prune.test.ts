@@ -301,8 +301,11 @@ test("CLI prune: dry run prints per-machine commands and deletes nothing; --appl
     const twin = cli(repo, env, "workspaces", "snapshot");
     assert.notEqual(twin.status, 0);
     assert.match(twin.stderr, /not written: .*already exists in the other memory home/);
-    assert.match(twin.stderr, /hunch workspaces forget ws_0123456789ab/);
-    rmSync(join(repo, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)); // what `forget` would do
+    // The stale twin is in the repo-tracked `.hunch/`, which `forget` refuses (an additive
+    // pump never stages a tracked deletion), so the remedy printed is the manual removal.
+    assert.match(twin.stderr, /the stale copy lives in this repo's \.hunch\//);
+    assert.match(twin.stderr, /git rm \.hunch\/workspaces\/ws_0123456789ab\.json/);
+    rmSync(join(repo, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)); // what the `git rm` recipe does
 
     const refused = cli(repo, env, "workspaces", "prune", "--apply");
     assert.notEqual(refused.status, 0);

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { tempStore, prov } from "./helpers.js";
+import { tempStore, prov, mkSymbol } from "./helpers.js";
 import { openMemoryDb, type DB } from "../src/store/db.js";
 import { HunchStore } from "../src/store/hunchStore.js";
 import { hunchPaths } from "../src/core/paths.js";
@@ -17,10 +17,10 @@ function seed() {
   const ctx = tempStore();
   const { store } = ctx;
   store.json.replaceAll("symbols", [
-    { id: "sym_a", file: "src/auth/session.ts", name: "verifySession", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 40, churn_90d: 14, bug_count: 3, fan_in: 2, fan_out: 0 }, last_changed: "" },
-    { id: "sym_b", file: "src/billing/charge.ts", name: "charge", kind: "function", signature_hash: "", calls: ["sym_a"], called_by: [], metrics: { loc: 30, churn_90d: 1, bug_count: 0, fan_in: 0, fan_out: 1 }, last_changed: "" },
-    { id: "sym_c", file: "src/api/mw.ts", name: "mw", kind: "function", signature_hash: "", calls: ["sym_a"], called_by: [], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 1 }, last_changed: "" },
-  ] as never);
+    mkSymbol("sym_a", "src/auth/session.ts", "verifySession", { metrics: { loc: 40, churn_90d: 14, bug_count: 3, fan_in: 2, fan_out: 0 } }),
+    mkSymbol("sym_b", "src/billing/charge.ts", "charge", { calls: ["sym_a"], metrics: { loc: 30, churn_90d: 1, bug_count: 0, fan_in: 0, fan_out: 1 } }),
+    mkSymbol("sym_c", "src/api/mw.ts", "mw", { calls: ["sym_a"], metrics: { loc: 10, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 1 } }),
+  ]);
   store.json.replaceAll("edges", [
     { id: "e1", from: "sym_b", to: "sym_a", type: "calls", reason: "", strength: 1, provenance: prov() },
     { id: "e2", from: "sym_c", to: "sym_a", type: "calls", reason: "", strength: 1, provenance: prov() },
@@ -75,9 +75,69 @@ test("a 0-byte per-record file (merge-driver tombstone) loads as absent — no c
   }
 });
 
+/** A decision fixture written straight to disk under an arbitrary file name. */
+function writeDecisionFile(root: string, name: string, id: string, title: string): void {
+  writeFileSync(join(root, ".hunch", "decisions", name), JSON.stringify({
+    id, title, status: "accepted", context: "", decision: "x", consequences: [], alternatives_rejected: [],
+    related_components: [], related_files: [], supersedes: null, caused_by_bug: null, commit: null,
+    provenance: prov(0.9), date: "2026-06-01T00:00:00Z",
+  }));
+}
+
+test("a stray copy of a record file loads once, from its canonical <id>.json (issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_stray.json", "dec_stray", "canonical");
+  writeDecisionFile(root, "dec_stray_BASE_1234.json", "dec_stray", "aborted mergetool copy");
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (msg: string) => { warns.push(String(msg)); };
+  try {
+    const hits = store.json.loadAll("decisions").filter((d) => d.id === "dec_stray");
+    assert.equal(hits.length, 1, "the stray copy contributes no second record");
+    assert.equal(hits[0]?.title, "canonical", "the canonical file wins");
+    assert.ok(warns.some((w) => w.includes("stray copy") && w.includes("dec_stray_BASE_1234.json")));
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
+test("reindex survives a stray copy instead of failing on a duplicate primary key (issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_stray.json", "dec_stray", "canonical");
+  writeDecisionFile(root, "dec_stray (1).json", "dec_stray", "cloud-sync conflict copy");
+  const orig = console.warn;
+  console.warn = () => {};
+  try {
+    const { counts } = store.reindex();
+    assert.equal(counts.decisions, 2, "dec_1 + dec_stray, counted once each");
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
+test("a misnamed record with NO canonical file is kept, exactly once (con_947c578b2c, issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_orphan.orig.json", "dec_orphan", "only home");
+  writeDecisionFile(root, "dec_orphan_BASE_9.json", "dec_orphan", "second misnamed copy");
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (msg: string) => { warns.push(String(msg)); };
+  try {
+    const hits = store.json.loadAll("decisions").filter((d) => d.id === "dec_orphan");
+    assert.equal(hits.length, 1, "never two records with the same id");
+    assert.equal(hits[0]?.title, "only home", "deterministic: the first sorted name wins");
+    assert.ok(warns.some((w) => w.includes("expected file name dec_orphan.json")));
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
 test("why() matches on path segments, never a bare suffix — 'io.ts' must not pull 'scenario.ts' records (issue #32)", () => {
   const { store, cleanup } = seed();
-  store.json.put("symbols", { id: "sym_scen", file: "src/x/scenario.ts", name: "scen", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 5, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);
+  store.json.put("symbols", mkSymbol("sym_scen", "src/x/scenario.ts", "scen", { metrics: { loc: 5, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 } }) as never);
   store.json.put("decisions", { id: "dec_scen", title: "Scenario decision", status: "accepted", context: "", decision: "x", consequences: [], alternatives_rejected: [], related_components: [], related_files: ["src/x/scenario.ts"], supersedes: null, caused_by_bug: null, commit: null, provenance: prov(0.9), date: "2026-06-01T00:00:00Z" } as never);
   store.reindex();
   const w = store.why("io.ts"); // "scenario.ts".endsWith("io.ts") is true — must NOT match
@@ -86,6 +146,24 @@ test("why() matches on path segments, never a bare suffix — 'io.ts' must not p
   // Segment-anchored suffix still works: the intended convenience is intact.
   const anchored = store.why("x/scenario.ts");
   assert.deepEqual(anchored.decisions.map((d) => d.id), ["dec_scen"]);
+  cleanup();
+});
+
+test("why() matches an existing full path exactly, never a same-basename suffix — root index.ts must not pull nested/index.ts's records (issue #299)", () => {
+  const { store, cleanup } = seed();
+  // Deliberately no real files on disk: "is this a real indexed path" must be
+  // answerable from already-loaded graph data alone, never the filesystem — a
+  // deleted-but-still-indexed path must answer the same either way (issue #299).
+  store.json.put("symbols", mkSymbol("sym_root_idx", "index.ts", "root", { kind: "variable" }) as never);
+  store.json.put("symbols", mkSymbol("sym_nested_idx", "vscode-extension/index.ts", "nested", { kind: "variable" }) as never);
+  store.json.put("constraints", { id: "con_nested", type: "correctness", statement: "nested rule", scope: ["vscode-extension/index.ts"], severity: "blocking", enforcement: "advisory_v1", rationale: "x", source_decision: null, violations: [], provenance: prov(0.9) } as never);
+  store.reindex();
+  const wRoot = store.why("index.ts");
+  assert.deepEqual(wRoot.symbols.map((s) => s.id), ["sym_root_idx"], "root index.ts must not resolve the nested symbol");
+  assert.deepEqual(wRoot.constraints.map((c) => c.id), [], "root index.ts must not inherit the nested-scoped constraint");
+  const wNested = store.why("vscode-extension/index.ts");
+  assert.deepEqual(wNested.symbols.map((s) => s.id), ["sym_nested_idx"]);
+  assert.deepEqual(wNested.constraints.map((c) => c.id), ["con_nested"]);
   cleanup();
 });
 

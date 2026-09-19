@@ -19,6 +19,7 @@ import { installPostCheckoutHook, installPostCommitHook, hookStatus } from "../s
 import { writeSlashCommands } from "../src/integrations/scaffold.js";
 import { branchRows, recordWorkspaceSnapshot, renderBranchTable, snapshotHasHome, workspaceSummaryLine, workspaceLedgerView } from "../src/integrations/workspaceLedger.js";
 import { WorkspaceSchema, workspaceId, type Workspace } from "../src/core/workspace.js";
+import { gitHeadUnsettled } from "../src/extractors/git.js";
 
 const PROJECT_ROOT = process.cwd();
 const TSX = join(PROJECT_ROOT, "node_modules/tsx/dist/cli.mjs");
@@ -209,6 +210,139 @@ test("recordWorkspaceSnapshot: off / no-home / written / unchanged / dry-run, on
       } finally { store.close(); }
     });
   } finally { cleanup(); }
+});
+
+// ---- issue #313: a public snapshot never writes mid-operation / on a detached HEAD ----------
+
+/** The fixture, switched to a PUBLIC home: no overlay, `publish_public: true` — the shape in
+ *  which a snapshot is a commit on the checked-out code branch. */
+function publicFixture(): ReturnType<typeof fixture> {
+  const f = fixture();
+  rmSync(join(f.repo, ".hunch", "local.json"));
+  writeFileSync(join(f.repo, ".hunch", "config.json"), JSON.stringify({ workspaces: { publish_public: true } }));
+  return f;
+}
+
+/** Nothing of this machine's record reached the code repo: no file, no dirty path under
+ *  .hunch/workspaces, no snapshot commit. */
+function assertNothingRecorded(repo: string): void {
+  assert.equal(existsSync(join(repo, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)), false, "no ws_*.json in the code repo");
+  const porcelain = g(repo, "status", "--porcelain");
+  assert.equal(porcelain.split("\n").some((l) => /\.hunch\/workspaces/.test(l)), false, `git status shows nothing under .hunch/workspaces (got: ${porcelain})`);
+  assert.doesNotMatch(g(repo, "log", "--format=%s", "-20"), /hunch: workspace snapshot/, "no snapshot commit");
+}
+
+/** Leave `repo` stopped in the middle of a rebase (or merge) on a conflict: two branches edit
+ *  the same line, and the replay cannot pick a side. */
+function conflictAndReplay(repo: string, kind: "rebase" | "merge"): void {
+  const here = g(repo, "rev-parse", "--abbrev-ref", "HEAD"); // whatever branch this checkout is on
+  commitFile(repo, "conflict.txt", "base\n", "base");
+  g(repo, "checkout", "-q", "-b", `conflict/${kind}`);
+  commitFile(repo, "conflict.txt", "theirs\n", "their edit");
+  g(repo, "checkout", "-q", here);
+  commitFile(repo, "conflict.txt", "ours\n", "our edit");
+  const res = spawnSync("git", [kind, `conflict/${kind}`], { cwd: repo, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+  assert.notEqual(res.status, 0, `git ${kind} must stop on the conflict`);
+}
+
+test("a PUBLIC snapshot defers mid-rebase and writes nothing; it records normally once the rebase is aborted (issue #313)", () => {
+  const { repo, env, cleanup } = publicFixture();
+  try {
+    withEnv({ ...env, HUNCH_PRIVATE_DIR: undefined }, () => {
+      conflictAndReplay(repo, "rebase");
+      assert.ok(existsSync(join(repo, ".git", "rebase-merge")) || existsSync(join(repo, ".git", "rebase-apply")), "the rebase really is in progress");
+      let store = new HunchStore(hunchPaths(repo));
+      try {
+        const out = recordWorkspaceSnapshot(store, repo);
+        assert.equal(out.status, "deferred");
+        assert.equal(out.status === "deferred" && out.reason, "git-operation-in-progress");
+        assertNothingRecorded(repo);
+      } finally { store.close(); }
+
+      g(repo, "rebase", "--abort");
+      store = new HunchStore(hunchPaths(repo));
+      try {
+        const out = recordWorkspaceSnapshot(store, repo);
+        assert.equal(out.status, "written", "a settled branch records as before");
+        assert.equal(out.status === "written" && out.home, "public");
+        assert.ok(existsSync(join(repo, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)));
+      } finally { store.close(); }
+    });
+  } finally { cleanup(); }
+});
+
+test("a PUBLIC snapshot defers on a detached HEAD and writes nothing (issue #313)", () => {
+  const { repo, env, cleanup } = publicFixture();
+  try {
+    withEnv({ ...env, HUNCH_PRIVATE_DIR: undefined }, () => {
+      g(repo, "checkout", "-q", "--detach");
+      const store = new HunchStore(hunchPaths(repo));
+      try {
+        const out = recordWorkspaceSnapshot(store, repo);
+        assert.equal(out.status, "deferred");
+        assert.equal(out.status === "deferred" && out.reason, "detached-head");
+        assertNothingRecorded(repo);
+      } finally { store.close(); }
+    });
+  } finally { cleanup(); }
+});
+
+test("a PUBLIC snapshot defers mid-merge (MERGE_HEAD present) and writes nothing (issue #313)", () => {
+  const { repo, env, cleanup } = publicFixture();
+  try {
+    withEnv({ ...env, HUNCH_PRIVATE_DIR: undefined }, () => {
+      conflictAndReplay(repo, "merge");
+      assert.ok(existsSync(join(repo, ".git", "MERGE_HEAD")), "the merge really is in progress");
+      const store = new HunchStore(hunchPaths(repo));
+      try {
+        const out = recordWorkspaceSnapshot(store, repo);
+        assert.equal(out.status, "deferred");
+        assert.equal(out.status === "deferred" && out.reason, "git-operation-in-progress");
+        assertNothingRecorded(repo);
+      } finally { store.close(); }
+    });
+  } finally { cleanup(); }
+});
+
+test("a PRIVATE overlay is its own repository: a detached code HEAD still records (issue #313)", () => {
+  const { repo, overlayRoot, env, cleanup } = fixture(); // overlay wired through local.json
+  try {
+    withEnv({ ...env, HUNCH_PRIVATE_DIR: undefined }, () => {
+      g(repo, "checkout", "-q", "--detach");
+      const store = new HunchStore(hunchPaths(repo));
+      try {
+        assert.equal(store.hasPrivate, true);
+        const out = recordWorkspaceSnapshot(store, repo);
+        assert.equal(out.status, "written", "private behaviour is unchanged by the guard");
+        assert.equal(out.status === "written" && out.home, "private");
+        assert.ok(existsSync(join(overlayRoot, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)));
+      } finally { store.close(); }
+    });
+  } finally { cleanup(); }
+});
+
+test("gitHeadUnsettled: null on a settled branch and outside a repo; per-worktree, so a rebase in a linked worktree is invisible to the main checkout (issue #313)", () => {
+  const base = mkdtempSync(join(tmpdir(), "hunch-unsettled-"));
+  try {
+    const repo = join(base, "repo");
+    g(base, "init", "-q", "-b", "main", repo); cfg(repo);
+    commitFile(repo, "a.txt", "a\n", "a");
+    assert.equal(gitHeadUnsettled(repo), null, "a settled branch");
+
+    const plain = join(base, "not-a-repo");
+    mkdirSync(plain, { recursive: true });
+    assert.equal(gitHeadUnsettled(plain), null, "not a git repo — fail open");
+
+    const wt = join(base, "wt");
+    g(repo, "worktree", "add", "-q", "-b", "side", wt);
+    conflictAndReplay(wt, "rebase");
+    assert.equal(gitHeadUnsettled(wt), "git-operation-in-progress", "the linked worktree is mid-rebase");
+    assert.equal(gitHeadUnsettled(repo), null, "the MAIN checkout of the same repo is untouched");
+
+    g(wt, "rebase", "--abort");
+    g(wt, "checkout", "-q", "--detach");
+    assert.equal(gitHeadUnsettled(wt), "detached-head");
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("workspaceSummaryLine reads stored records only and counts machines, dirty worktrees and deletable branches", () => {

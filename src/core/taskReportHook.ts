@@ -6,7 +6,7 @@ import type { HookProvider, HunchHookInput } from "./agenthook.js";
 import { findRoot } from "./paths.js";
 import { canonicalReportRoot } from "./taskReportPaths.js";
 import { isCredentialFreeText } from "./types.js";
-import { aliasReportTask, continuationLinks, finishReportTask, isEmptyTaskReport, latestSessionTask, readTaskReport, recordReportRefusal, reportHash, reportPresentationEnabled, resolveReportTask, settleSessionTasks, startReportTask, type TaskLinks } from "./taskReport.js";
+import { aliasReportTask, continuationLinks, finishReportTask, isEmptyTaskReport, latestSessionTask, readTaskReport, recordReportRefusal, reportHash, reportPresentationEnabled, reportTaskExists, resolveReportTask, settleSessionTasks, startReportTask, type TaskLinks } from "./taskReport.js";
 import { reportSourceSnapshot } from "./taskReportEvidence.js";
 import { renderTaskReport } from "./taskReportRender.js";
 
@@ -75,7 +75,17 @@ function identity(root: string, provider: HookProvider, event: HunchHookInput): 
 export function hookReportTaskId(root: string, provider: HookProvider, event: HunchHookInput): string | null {
   try {
     const id = identity(root, provider, event);
-    return id === "legacy" ? null : id;
+    if (!id || id === "legacy") return null;
+    // A subagent's tool call carries the prompt's session and prompt identity
+    // plus its own agent_id, and no prompt ever opens a task under that
+    // identity (subagents never fire UserPromptSubmit): its deliveries and
+    // denials belong to the prompt's task. An agent-scoped task that DOES
+    // exist keeps its own evidence, and without a prompt task nothing is guessed.
+    if (event.agent_id && event.session_id && event.prompt_id && !reportTaskExists(root, id)) {
+      const parent = resolveReportTask(root, promptTaskId(root, event.session_id, event.prompt_id, null, provider));
+      if (reportTaskExists(root, parent)) return parent;
+    }
+    return id;
   } catch { return null; }
 }
 

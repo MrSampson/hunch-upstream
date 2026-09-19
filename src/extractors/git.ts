@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { devNull, tmpdir } from "node:os";
 import { isAbsolute, resolve, join, basename, dirname, relative, sep } from "node:path";
-import { mkdtempSync, openSync, closeSync, readSync, mkdirSync, rmSync, statSync, lstatSync, realpathSync, readFileSync, renameSync, readdirSync } from "node:fs";
+import { mkdtempSync, openSync, closeSync, readSync, mkdirSync, rmSync, statSync, lstatSync, realpathSync, readFileSync, renameSync, readdirSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MEMLOG_FORMAT } from "../core/memorylog.js";
 import { hunchAttributesAreSafe, hunchTreeAttributesAreSafe, safeOverlayGitTreeListing, safeOverlayTree } from "../core/overlaySafety.js";
@@ -1623,6 +1623,16 @@ type CommitLockAttempt =
   | { state: "held-unknown" };
 
 const UNKNOWN_LOCK_STALE_MS = 10 * 60_000;
+// An owner-less lock directory is also a NORMAL transient state: the window
+// between the two mkdir calls in createOwnedCommitLock, the release window where
+// recursive cleanup removes owner-<pid> before the outer directory, and a lost
+// reclaim race. This bounds how long a lock may stay owner-less before it is
+// treated as stranded. At ENTRY it is compared with the directory's mtime
+// (creating the directory, or adding/removing a child entry, touches it), so an
+// old stranded lock no-ops instantly. INSIDE the wait loop it is a local
+// continuously-owner-less timer instead, so the wait depends on neither
+// filesystem mtime semantics nor clock agreement between writers.
+const OWNERLESS_LOCK_FRESH_MS = 2_000;
 
 function createOwnedCommitLock(lock: string): boolean {
   let created = false;
@@ -1630,8 +1640,9 @@ function createOwnedCommitLock(lock: string): boolean {
     // mkdir is the exclusive atomic operation here. Renaming a staged directory
     // is NOT exclusive on POSIX: it may replace an already-existing empty lock
     // directory, which would steal a fresh legacy/ownerless lock. There is a
-    // harmless ownerless window between these two mkdir calls; contenders treat
-    // it as held until the conservative legacy TTL expires.
+    // harmless ownerless window between these two mkdir calls: it reads as held,
+    // and is reclaimed only after the conservative legacy TTL expires. A capture
+    // waits it out (waitForCommitLockHandoff); other callers just report busy.
     mkdirSync(lock);
     created = true;
     // Empty directories are not Git worktree entries, so owner metadata cannot
@@ -1700,22 +1711,58 @@ function acquireCommitLock(lock: string): CommitLockAttempt {
   return createOwnedCommitLock(lock) ? { state: "acquired" } : { state: "held-unknown" };
 }
 
+/** Is an owner-less lock directory recent enough to be a transient window
+ * rather than a stranded one? Only meaningful for the FIRST snapshot, where
+ * there is no local history to measure against. An unreadable directory is not
+ * assumed transient: only ENOENT is, because the owner may have just finished
+ * releasing. `Math.abs` so a clock-skewed far-FUTURE mtime is not read as
+ * recent forever. */
+function ownerlessLockLooksTransient(lock: string): boolean {
+  try { return Math.abs(Date.now() - statSync(lock).mtimeMs) <= OWNERLESS_LOCK_FRESH_MS; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+}
+
 function waitForCommitLockHandoff(
   lock: string,
   first: CommitLockAttempt,
   timeoutMs: number,
 ): boolean {
-  if (first.state !== "held-live" || first.ownerPid === process.pid) return false;
+  if (first.state === "held-live" && first.ownerPid === process.pid) return false;
+  // An owner-less FIRST snapshot is either a transient window (creation,
+  // release, lost reclaim race) or a stranded/legacy lock. Only the former is
+  // worth waiting for: a stranded lock must not block the capture for the whole
+  // handoff. This is the one place the WAIT POLICY consults the directory's
+  // mtime; acquireCommitLock still stats it for the legacy reclaim TTL.
+  if (first.state === "held-unknown" && !ownerlessLockLooksTransient(lock)) return false;
   const deadline = Date.now() + timeoutMs;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   let attempt: CommitLockAttempt = first;
+  // How long the lock has read as held-unknown CONTINUOUSLY, measured locally:
+  // a sighting of a live owner resets it, because a genuine release window lasts
+  // milliseconds. Reading it from this clock keeps the wait independent of the
+  // filesystem's mtime granularity and of other writers' clocks. Besides a truly
+  // owner-less directory this also covers a dead owner whose reclaim another
+  // process has claimed — equally not a handoff this contender can wait for.
+  let ownerlessSince: number | null = first.state === "held-unknown" ? Date.now() : null;
+  // "Held" while the directory is not even there means mkdir keeps failing for a
+  // reason that is not contention — a missing, read-only or full store — and no
+  // amount of waiting will hand anything off. Require a short streak so one
+  // sample taken mid-release is not mistaken for it.
+  let vanishedStreak = 0;
   while (Date.now() < deadline) {
     if (attempt.state === "acquired") return true;
-    // Once the first snapshot proved a live owner, an owner-less snapshot can be
-    // the normal release window: recursive cleanup removes owner-<pid> before
-    // removing the outer lock directory. Keep the bounded handoff wait through
-    // that transient state instead of reporting a false busy/no-op result.
-    if (attempt.state === "held-live" && attempt.ownerPid === process.pid) return false;
+    if (attempt.state === "held-live") {
+      if (attempt.ownerPid === process.pid) return false;
+      ownerlessSince = null;
+      vanishedStreak = 0;
+    } else if (attempt.state === "held-unknown") {
+      ownerlessSince ??= Date.now();
+      if (Date.now() - ownerlessSince > OWNERLESS_LOCK_FRESH_MS) return false;
+      if (!existsSync(lock)) {
+        vanishedStreak += 1;
+        if (vanishedStreak >= 3) return false;
+      } else vanishedStreak = 0;
+    }
     Atomics.wait(sleeper, 0, 0, Math.min(25, deadline - Date.now()));
     attempt = acquireCommitLock(lock);
   }
@@ -1800,6 +1847,26 @@ export function isLinkedWorktree(cwd: string): boolean {
 export function currentBranch(cwd: string): string {
   const b = gitSafe(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   return b === "HEAD" ? "" : b; // detached HEAD reports "HEAD" — treat as no branch
+}
+
+/** The state files git writes while it is replaying history. `git rev-parse --git-path`
+ *  resolves each against THIS worktree's private git dir (a linked worktree keeps its own
+ *  rebase-merge/MERGE_HEAD), so a rebase in one worktree never reads as one in another. */
+const UNSETTLED_HEAD_PATHS = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"] as const;
+
+/** Whether HEAD is somewhere a write must not land: mid rebase/merge/cherry-pick/revert/bisect
+ *  ("git-operation-in-progress", which wins when both hold), or detached ("detached-head").
+ *  null when HEAD is a settled branch — and also when git cannot answer at all (not a repo,
+ *  git missing), so a caller keeps its pre-existing behavior rather than failing closed. */
+export function gitHeadUnsettled(cwd: string): "git-operation-in-progress" | "detached-head" | null {
+  // One spawn: `git rev-parse --git-path a --git-path b …` prints one line per path.
+  const out = gitSafe(["rev-parse", ...UNSETTLED_HEAD_PATHS.flatMap((p) => ["--git-path", p])], cwd);
+  if (!out) return null; // git could not answer (not a repo) — fail open
+  const paths = out.split("\n").map((p) => p.trim()).filter(Boolean);
+  if (paths.length !== UNSETTLED_HEAD_PATHS.length) return null;
+  if (paths.some((p) => existsSync(isAbsolute(p) ? p : resolve(cwd, p)))) return "git-operation-in-progress";
+  // `git symbolic-ref -q HEAD` exits non-zero exactly when HEAD is detached.
+  return gitSafe(["symbolic-ref", "-q", "HEAD"], cwd) ? null : "detached-head";
 }
 
 /** Files changed in a single commit. `--root` makes the initial commit (which

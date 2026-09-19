@@ -146,6 +146,13 @@ mode (no overlay configured) the record is written to the repo-tracked `.hunch/`
 `workspaces.publish_public: true`; the default is to skip with a one-line `doctor` hint, because
 committing per-machine paths into the code repository is rarely wanted.
 
+A snapshot bound for the PUBLIC `.hunch/` is a commit on the checked-out code branch, so it
+**defers** (`deferred`, reason `git-operation-in-progress` or `detached-head`) whenever git is
+replaying history — rebase, merge, cherry-pick, revert, bisect — or HEAD is detached: `git rebase`
+itself fires post-checkout, and an untracked `ws_*.json` appearing mid-rebase makes
+`git rebase --continue` abort. Nothing is lost; the next branch checkout or ledger read records
+the machine. A private overlay is its own repository, so overlay snapshots never defer.
+
 Hook cost guard: the hook runs the snapshot in the background (`&`, the same shell pattern the
 post-commit capture line uses — nothing is detach-spawned any more) and skips the write when the
 stored record is younger than one day and its content is unchanged, so `git checkout` latency is
@@ -173,7 +180,9 @@ machine-9f2c      yes                          fix/old    -      77d ago      9d
 
 Flags: `--machine <label>`, `--branch <name>`, `--fetch`, `--json`. Companions: `hunch
 workspaces label [label]` (show/set this machine's label, warns when it equals the hostname or
-username) and `hunch workspaces forget <machine>` (drop a retired machine's record).
+username) and `hunch workspaces forget <machine>` (drop a retired machine's overlay record; a
+record committed into this repo's `.hunch/` under `publish_public` is refused with the manual
+`git rm .hunch/workspaces/<id>.json` recipe instead).
 
 ### `hunch branches` — the verdicts (shipped)
 
@@ -259,7 +268,12 @@ Two knobs in `.hunch/config.json` under `workspaces`:
 
 Machine labels are user-chosen and should not embed personal data; `doctor` warns when a label
 equals the hostname or the OS username. `hunch workspaces forget <machine>` removes a retired
-machine's record from the store (a normal, revertable memory move in `hunch log`).
+machine's record from the overlay (a normal, revertable memory move in `hunch log`). It REFUSES
+a record living in the repo-tracked `.hunch/` (`publish_public`): Hunch publication is additive
+and never stages a tracked deletion, so deleting the file would strand `D
+.hunch/workspaces/<id>.json` and wedge every later auto-commit. The command prints the manual
+recipe — `git rm .hunch/workspaces/<id>.json` then a commit — which the human runs as an
+ordinary reviewable change.
 
 ## Security and privacy
 
@@ -292,7 +306,7 @@ tests named in the last column.
 | Git hook executing untrusted content | The post-checkout / post-commit blocks call the pinned `hunch` invocation with a constant argument list (`workspaces snapshot --quiet`); no argument is derived from repository content. Hook blocks are the same managed-block mechanism `hunch init` already uses, install only when the user runs `hunch init`, and are inspectable in `.git/hooks`. | hook-content snapshot test |
 | Unattended destructive action | `--apply` is CLI-only, local-machine-only, `git branch -d` / `git worktree remove` without force flags, requires interactive confirmation or an explicit `--yes`, and never touches remote branches. The MCP tool is read-only. Nothing runs on another machine. | tests for each refusal path |
 | Secret leakage into memory | Every string field passes the existing credential filters; remote URLs, commit messages, diffs, file names, author emails and environment variables are not recorded at all. A record that fails the filter is rejected, not trimmed. | credential fixtures rejected |
-| Personal data | No hostname, OS username, home directory, hardware id or MAC address is recorded. Default label is `machine-<4 hex>`; `doctor` warns on a hostname/username label. `hunch workspaces forget <machine>` deletes a machine's record; the overlay's git history is the organization's own repository, subject to its retention. | field-level tests |
+| Personal data | No hostname, OS username, home directory, hardware id or MAC address is recorded. Default label is `machine-<4 hex>`; `doctor` warns on a hostname/username label. `hunch workspaces forget <machine>` deletes a machine's overlay record (a `publish_public` record in the repo-tracked `.hunch/` is refused with a `git rm .hunch/workspaces/<id>.json` recipe, since an additive pump cannot stage the deletion); the overlay's git history is the organization's own repository, subject to its retention. | field-level tests |
 | Impersonation in a shared overlay (a teammate writing a record under another machine id) | Records carry no authority: they never gate a write, a merge or a delete, so a forged record can at most mislabel a row. The overlay's git commit author remains the audit trail. | documented; no code path grants trust to a record |
 | Supply chain | No new runtime dependency. Node built-ins and git only. | `package.json` diff |
 | Availability / performance | Hook snapshot is backgrounded, skips when the record is < 60 s old, is bounded to a fixed set of git commands with timeouts (the `timeout: 5_000` pattern in `src/extractors/git.ts`), and a failure never blocks the checkout or commit. | hook latency test |

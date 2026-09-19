@@ -14,13 +14,13 @@
  *   doctor    environment diagnostics
  */
 import "./preflight.js"; // MUST stay the first import — Node-version gate before node:sqlite loads
-import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, rmdirSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, rmdirSync, symlinkSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join, relative, dirname, basename, resolve, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { hunchPaths, hunchPathsForDir, findRoot, toPosixTarget, isDir } from "../core/paths.js";
+import { hunchPaths, hunchPathsForDir, findRoot, toPosixTarget, isDir, realpathNorm, repoRelativeTarget } from "../core/paths.js";
 import { writeFileAtomic } from "../core/io.js";
 import { looksLikeCorrection, CORRECTION_NUDGE } from "../core/correction.js";
 import { HUNCH_VERSION } from "../core/version.js";
@@ -36,7 +36,7 @@ import { publishedStatus, type PublishedStatus } from "../integrations/registry.
 import { HunchStore } from "../store/hunchStore.js";
 import { JsonStore } from "../store/jsonStore.js";
 import { selectEmbedder } from "../store/embedder.js";
-import { assertCompleteRepoScan, indexRepo, scanRepo } from "../extractors/indexer.js";
+import { assertCompleteRepoScan, indexRepo, mergeScannedEdges, scanRepo } from "../extractors/indexer.js";
 import { syncCommit, recordFailure, captureTestRun } from "../synthesis/synthesize.js";
 import { parseTestReport } from "../extractors/testreport.js";
 import {
@@ -89,7 +89,7 @@ import { diffProjectDna } from "../core/projectDnaDelta.js";
 import { projectDnaDeliverySupplement } from "../core/projectDnaDelivery.js";
 import { readConfig, writeConfig, FIRMNESS_LEVELS, isFirmness, type Firmness, workspacesConfig } from "../core/config.js";
 import { loadOrCreateMachine, setMachineLabel, machineFile, labelLeaksIdentity } from "../core/machine.js";
-import { worktreeRows, branchRows } from "../core/workspace.js";
+import { worktreeRows, branchRows, publicWorkspaceRemovalRecipe } from "../core/workspace.js";
 import { workspaceLedgerView, recordWorkspaceSnapshot, renderWorktreeTable, renderBranchTable, workspaceSummaryLine, prunePlanFor, renderPrunePlan, applyPrune, confirmPrune, pruneConfirmQuestion } from "../integrations/workspaceLedger.js";
 import { blockingInScope, vetoInScope, proposedEditLines, type BlockingHit } from "../core/hookpolicy.js";
 import { isHumanConfirmed } from "../core/strictgate.js";
@@ -97,7 +97,7 @@ import { appendEvent, readEvents } from "../core/events.js";
 import { computeStats, formatStats } from "../core/stats.js";
 import { injectionMode, resetSessionInjections } from "../core/hookcache.js";
 import { recordServed, servedSummary } from "../core/served.js";
-import { recordTaskDelivery, reportActivity, reportPresentationEnabled, unseenLessons } from "../core/taskReport.js";
+import { recordTaskDelivery, reportActivity, reportHash, reportPresentationEnabled, unseenLessons } from "../core/taskReport.js";
 import { snapshotDeliveredRecords } from "../core/taskReportEvidence.js";
 import { renderRecalledLine } from "../core/taskReportRender.js";
 import { closeHookTask, hookReportTaskId, nativeHookCwd, settleHookSession, startHookReport, stopHookReport, observeHookDenial } from "../core/taskReportHook.js";
@@ -393,7 +393,7 @@ program
         // any mutator. With no commit identity there is no safe public source,
         // so leave no source-derived records behind for a future pump.
         store.json.replaceAll("symbols", []);
-        store.json.replaceAll("edges", []);
+        store.json.replaceAll("edges", mergeScannedEdges(store.json.loadAll("edges"), []));
         store.json.replaceAll("components", []);
         store.reindex();
         console.log("  ⚠ skipped code graph: no committed HEAD — commit code, then run `hunch index`");
@@ -1513,8 +1513,15 @@ workspacesCmd
           return console.log("  · or set .hunch/config.json {\"workspaces\":{\"publish_public\":true}} to commit it into this repo's .hunch/");
         case "unchanged":
           return console.log(`✓ unchanged since ${out.previous.observed_at} (${out.record.id}) — nothing written`);
+        case "deferred":
+          return console.log(out.reason === "detached-head"
+            ? "deferred: HEAD is detached — the next checkout or ledger read records this machine"
+            : "deferred: a git operation is in progress — the next checkout or ledger read records this machine");
         case "collision":
-          return fail(`not written: ${out.reason}\n  · \`hunch workspaces forget ${out.record.id}\` removes the stale copy (a normal, revertable memory move), then snapshot again`);
+          // The capture is routed to the overlay, so the only home it can collide with is
+          // this repo's committed `.hunch/`. `forget` refuses that record (an additive pump
+          // never stages a deletion), so the recipe here is the manual git removal.
+          return fail(`not written: ${out.reason}\n  the stale copy lives in this repo's .hunch/ — remove it by hand, then snapshot again:\n${publicWorkspaceRemovalRecipe(out.record.id, out.record.machine.label)}`);
         case "written":
           return console.log(`✓ recorded ${out.record.worktrees.length} worktree(s), ${out.record.branches.length} branch(es) as ${out.record.machine.label} (${out.record.id}, publish=${out.record.publish}) → ${out.home === "private" ? "overlay" : "public .hunch/"}${out.flushed ? `, ${out.flushed}` : ""}`);
       }
@@ -1561,7 +1568,7 @@ workspacesCmd
       for (const r of results) console.log(`  ${r.outcome === "deleted" ? "✓" : r.outcome === "skipped" ? "–" : "✗"} ${r.step.branch}: ${r.detail}`);
       const failed = results.filter((r) => r.outcome === "failed").length;
       const skipped = results.filter((r) => r.outcome === "skipped").length;
-      const ledger = recorded === "written" ? " · ledger updated" : recorded === "unchanged" || recorded === "no-home" || recorded === "off" ? "" : ` · ledger not updated (${recorded})`;
+      const ledger = recorded === "written" ? " · ledger updated" : recorded === "unchanged" || recorded === "no-home" || recorded === "off" ? "" : recorded === "deferred" ? " · ledger deferred (git operation in progress or detached HEAD)" : ` · ledger not updated (${recorded})`;
       console.log(`\n${results.length - failed - skipped} deleted, ${skipped ? `${skipped} skipped (nothing changed), ` : ""}${failed} refused by git${ledger}`);
       if (failed || skipped) process.exitCode = 1;
     } finally {
@@ -1587,11 +1594,25 @@ workspacesCmd
     try {
       const victims = store.recs("workspaces").filter((r) => r.machine.label === machine || r.machine.id === machine || r.id === machine);
       if (!victims.length) return fail(`no workspace record for "${machine}" — \`hunch workspaces\` lists the machines in memory`);
-      // Decide each record's home BEFORE deleting it, then flush exactly those homes.
-      const homes: MemoryHome[] = victims.map((v) => store.getPrivateRec("workspaces", v.id) ? "private" : "public");
-      for (const v of victims) store.deleteWhereItLives("workspaces", v.id);
-      pumpMemoryHomes(store, root, homes, `hunch: forget workspace ${machine}`);
-      console.log(`✓ forgot ${victims.length} record(s) for ${machine}`);
+      // Decide each record's home BEFORE deleting anything, then flush exactly those homes.
+      // A PUBLIC record (workspaces.publish_public) is refused rather than deleted: the
+      // memory pump never stages a tracked deletion, so removing the file here would strand
+      // `D .hunch/workspaces/<id>.json` and wedge every later auto-commit — see
+      // publicWorkspaceRemovalRecipe.
+      const overlay = victims.filter((v) => store.getPrivateRec("workspaces", v.id));
+      const refused = victims.filter((v) => !store.getPrivateRec("workspaces", v.id));
+      for (const v of overlay) store.deleteWhereItLives("workspaces", v.id);
+      if (overlay.length) {
+        pumpMemoryHome(store, root, "private", `hunch: forget workspace ${machine}`);
+        console.log(`✓ forgot ${overlay.length} record(s) for ${machine}`);
+      }
+      for (const v of refused) {
+        console.log(
+          `refused: ${v.id} (${v.machine.label}) lives in this repo's .hunch/ — Hunch publication is additive and never stages a deletion, so it is removed by hand:\n`
+          + publicWorkspaceRemovalRecipe(v.id, v.machine.label),
+        );
+      }
+      if (refused.length && !overlay.length) process.exitCode = 1;
     } finally {
       store.close();
     }
@@ -4278,12 +4299,17 @@ program
   .requiredOption("--by <new>", "decision id that supersedes it")
   .action((oldId: string, opts: { by: string }) => {
     const { store, root } = storeFor();
-    const by = store.json.get("decisions", opts.by);
-    if (!by) { store.close(); return fail(`--by decision "${opts.by}" not found`); }
-    const closed = store.supersede(oldId, by);
-    if (!closed) { store.close(); return fail(`decision "${oldId}" not found (or same as --by)`); }
+    // `old`'s home decides which store the close is written to; `--by` must resolve in
+    // that SAME store, or a private `by` linked against a public `old` would write the
+    // private id straight into the committed public store.
+    const home = decisionMemoryHome(store, oldId);
+    if (!store.decisionInStore(oldId, home === "private")) { store.close(); return fail(`decision "${oldId}" not found`); }
+    const by = store.decisionInStore(opts.by, home === "private");
+    if (!by) { store.close(); return fail(`--by decision "${opts.by}" not found in the ${home} store that holds "${oldId}"`); }
+    const closed = home === "private" ? store.supersedePrivate(oldId, by) : store.supersede(oldId, by);
+    if (!closed) { store.close(); return fail(`decision "${oldId}" cannot supersede itself`); }
     store.reindex();
-    pumpMemoryHome(store, root, "public", `hunch: supersede ${oldId} by ${opts.by}`);
+    pumpMemoryHome(store, root, home, `hunch: supersede ${oldId} by ${opts.by}`);
     console.log(`✓ ${oldId} superseded by ${opts.by} — window closed at ${closed.valid_to?.slice(0, 10)}.`);
     store.close();
   });
@@ -4519,9 +4545,11 @@ program
         if (/^(Edit|Write|MultiEdit)$/.test(evt.tool_name ?? "")) {
           // A Codex apply_patch touches every file it lists (and each Move-to
           // destination); the Stop gate must see all of them, not only the first.
-          const patchPaths = evt.tool_input?.patch_files?.flatMap((f) => f.moved_to ? [f.path, f.moved_to] : [f.path]);
-          const edited = patchPaths?.length ? patchPaths : evt.tool_input?.file_path ? [evt.tool_input.file_path] : [];
-          for (const p of edited) st = onEdit(st, toRepoRel(root, p));
+          // Same in-repo filter as the pre-edit path: a scratch file outside the
+          // repository is not a product edit, and recording it would block Stop on
+          // a path no check can ever verify.
+          const edited = editTargets(root, evt.tool_input);
+          for (const e of edited) st = onEdit(st, e.target);
           if (edited.length) activity = { kind: "edit" };
         } else if (evt.tool_name === "Bash" || evt.tool_name === "PowerShell") {
           const command = String(evt.tool_input?.command ?? "");
@@ -4936,7 +4964,11 @@ program
       const reportTaskId = hookReportTaskId(root, provider, evt);
       // A new authoritative prompt gets its own full delivery. An earlier
       // prompt's session-level delta cannot establish this task's receipt.
-      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}`, text) === "delta") {
+      // A subagent reports to the prompt's task but starts with FRESH context:
+      // it never saw that grounding, so its dedup is scoped by its own agent
+      // identity (hashed — the raw agent_id is never retained in the key).
+      const agentKey = evt.agent_id ? `:${reportHash(evt.agent_id).slice(7, 19)}` : "";
+      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}${agentKey}`, text) === "delta") {
         receipts("refreshed");
         emitContext(
           provider,
@@ -6803,27 +6835,17 @@ function readStdin(): Promise<string> {
 }
 
 /** Absolute edit path → repo-relative, forward-slash (constraint scopes are
- *  forward-slash globs even on Windows). */
-/** realpath a path even if it doesn't exist yet (a new file an agent is about to
- *  Write): resolve the longest existing ancestor, then re-append the missing tail.
- *  Idempotent on already-resolved paths. */
-function realpathNorm(p: string): string {
-  try {
-    return realpathSync.native(p);
-  } catch {
-    const parent = dirname(p);
-    if (parent === p) return p; // hit the root; nothing more to resolve
-    return join(realpathNorm(parent), basename(p));
-  }
-}
-
-/** Repo-relative POSIX path. BOTH ends are realpath-normalized first: on macOS
- *  `process.cwd()` (hence findRoot) resolves /var→/private/var, but a hook event's
- *  file_path arrives UN-resolved — so a naive relative() yields a bogus "../" path
- *  under any symlinked root (/var, /tmp, symlinked $HOME) and the caller treats the
- *  file as outside the repo, silently dropping all context (dec_e0a36efbf5). */
+ *  forward-slash globs even on Windows), or "" when `abs` isn't (resolvably)
+ *  inside `root`. Thin adapter over the shared `repoRelativeTarget` (core/paths.ts,
+ *  which realpath-normalizes both ends first — see its docstring for why, incl.
+ *  dec_e0a36efbf5): that function passes an unresolvable absolute path through
+ *  UNCHANGED (still absolute) rather than signaling failure directly, since other
+ *  callers want the original target back to fail their own match safely. This
+ *  adapter converts that "still absolute" signal to "" — the sentinel `onEdit`
+ *  and `editTargets` below already treat as "skip, not in this repo". */
 function toRepoRel(root: string, abs: string): string {
-  return relative(realpathNorm(root), realpathNorm(abs)).split("\\").join("/");
+  const rel = repoRelativeTarget(abs, root);
+  return isAbsolute(rel) || /^[a-zA-Z]:/.test(rel) ? "" : rel;
 }
 
 /** The in-repo files a pre-edit event would change, each with the lines the edit

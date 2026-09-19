@@ -6,6 +6,7 @@
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { writeFileAtomic } from "../core/io.js";
 import { join, dirname } from "node:path";
+import { isHunchHookCommand } from "./hookmatch.js";
 
 export interface Invocation {
   command: string;
@@ -137,24 +138,25 @@ interface HookEntry {
   hooks?: Array<{ type?: string; command?: string }>;
 }
 
-/** A settings.json hook entry is Hunch's if any of its commands is either the
- *  native/source CLI entry (`…/index.js hook`) or the exact published-package
- *  launcher written by older Hunch versions (`npx --package=…@davesheffer/hunch…
- *  hunch hook`). Matching both generations makes an upgrade idempotent instead
- *  of leaving the portable old hook alongside the new native invocation. The
- *  source form still requires `index` to be a full path segment, and the npx form
- *  requires both the scoped package and the `hunch hook` tail, so foreign hooks
- *  are preserved. */
-function isHunchHook(entry: HookEntry): boolean {
-  return !!entry.hooks?.some((h) => {
-    if (typeof h.command !== "string") return false;
-    const command = h.command;
-    const nativeOrSource = /(?:dist|src)[\\/]+cli[\\/]+index\.(js|ts)"?\s+hook\s*$/.test(command);
-    const publishedNpx = /^\s*"?npx(?:\.cmd)?"?\s+/i.test(command)
-      && /--package=(?:hunch-exact@npm:)?@davesheffer\/hunch(?:@[^"\s]+)?/.test(command)
-      && /\s"?hunch"?\s+"?hook"?\s*$/.test(command);
-    return nativeOrSource || publishedNpx;
-  });
+/** Strip Hunch's own commands out of one settings.json hook entry, matching with
+ *  the SAME anchored rule the provider writers use (isHunchHookCommand, issue
+ *  #41) so an unrelated tool that merely shares our layout — `node
+ *  tools/lint/dist/cli/index.js hook` — is never classified as ours. Claude
+ *  Code's hooks carry no `--provider`, hence the bare-tail variant.
+ *
+ *  Filtering per COMMAND rather than per entry is what keeps a MIXED entry (our
+ *  hook and the user's own command side by side) intact: the entry survives with
+ *  its matcher and the user's remaining commands in order, and is dropped only
+ *  when nothing of the user's is left. Dropping the whole entry deleted user
+ *  hooks (con_8460b6770f, issue #310). */
+function withoutHunchCommands(entry: HookEntry, hookCmd: string): HookEntry | null {
+  const hooks = entry.hooks;
+  if (!Array.isArray(hooks)) return entry;
+  // The command being installed is ours by definition, whatever shape a future
+  // launcher takes — so a re-run stays idempotent even if the matcher lags it.
+  const kept = hooks.filter((h) => !(typeof h?.command === "string" && (h.command === hookCmd || isHunchHookCommand(h.command, false))));
+  if (kept.length === hooks.length) return entry;
+  return kept.length ? { ...entry, hooks: kept } : null;
 }
 
 /**
@@ -165,7 +167,7 @@ function isHunchHook(entry: HookEntry): boolean {
  *   - UserPromptSubmit → remind the agent to consult Hunch.
  * Both invoke `hunch hook`, which reads the firmness level from .hunch/config.json
  * at run time — so changing firmness needs no settings.json edit. We own only our
- * entries (matched by isHunchHook): other hooks and settings are preserved, and a
+ * commands (matched by isHunchHookCommand): other hooks and settings are preserved, and a
  * non-empty file we cannot parse THROWS rather than clobbering the user's config.
  */
 export function installClaudeHooks(root: string, hookCmd: string): ClaudeHookInstall {
@@ -196,7 +198,8 @@ export function installClaudeHooks(root: string, hookCmd: string): ClaudeHookIns
       throw new Error(`refusing to edit ${file}: hooks.${event} must be an array when present; fix it, then re-run.`);
     }
   }
-  const keep = (arr?: HookEntry[]) => (Array.isArray(arr) ? arr.filter((e) => !isHunchHook(e)) : []);
+  const keep = (arr?: HookEntry[]) =>
+    (Array.isArray(arr) ? arr.map((entry) => withoutHunchCommands(entry, hookCmd)).filter((e): e is HookEntry => e !== null) : []);
 
   json.hooks.PreToolUse = [
     ...keep(json.hooks.PreToolUse),
