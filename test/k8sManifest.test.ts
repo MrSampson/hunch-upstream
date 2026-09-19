@@ -791,3 +791,226 @@ test("spec.template.spec.imagePullSecrets[].name produces a Secret reference can
   assert.ok(ref);
   assert.equal((ref!.name as { value: string }).value, "my-registry-secret");
 });
+
+// Issue #297 gap 2: a `- |` list item's block-scalar body is opaque TEXT (the
+// idiomatic way a chart inlines a shell script into args:/command:), but it
+// matches neither KEY_LINE nor BARE_LIST_MARKER, so it fell to the
+// unrecognized-line branch and its body -- which routinely contains a
+// heredoc'd manifest -- was scanned as the surrounding container's fields,
+// inventing references to resources that only ever existed as script text.
+
+test("a script inlined via a `- |` args item does not yield phantom references from its heredoc'd manifest text", () => {
+  const src = [
+    `apiVersion: batch/v1`, `kind: Job`, `metadata:`, `  name: migrate`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: runner`,
+    `        args:`,
+    `        - |`,
+    `          cat <<EOF`,
+    `          env:`,
+    `          - name: DB_PASSWORD`,
+    `            valueFrom:`,
+    `              secretKeyRef:`,
+    `                name: prod-db-creds`,
+    `          EOF`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.kind, "Job");
+  assert.equal(
+    doc!.references.find((r) => (r.name as { value?: string }).value === "prod-db-creds"),
+    undefined,
+    "a secretKeyRef that exists only as script text must not become a reference",
+  );
+});
+
+test("a REAL secretKeyRef on a container declared after a `- |` args item is still extracted (the skip ends at the right line)", () => {
+  const src = [
+    `apiVersion: batch/v1`, `kind: Job`, `metadata:`, `  name: migrate`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: runner`,
+    `        args:`,
+    `        - |`,
+    `          cat <<EOF`,
+    `          env:`,
+    `          - name: DB_PASSWORD`,
+    `            valueFrom:`,
+    `              secretKeyRef:`,
+    `                name: prod-db-creds`,
+    `          EOF`,
+    `      - name: sidecar`,
+    `        env:`,
+    `          - name: REAL`,
+    `            valueFrom:`,
+    `              secretKeyRef:`,
+    `                name: real-secret`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  const names = doc!.references.filter((r) => r.refKind === "Secret").map((r) => (r.name as { value: string }).value);
+  assert.deepEqual(names, ["real-secret"], "only the real second container's secretKeyRef, never the scripted one");
+});
+
+test("a column-0 {{ }} action inside a `- |` script body does not end the skip and re-expose the rest as fields", () => {
+  // A `{{ }}` action line's own indentation is meaningless (`{{-` chomps it,
+  // `| indent N` puts it at column 0), so it must never read as a dedent out
+  // of the block scalar -- otherwise every body line after it is scanned as
+  // manifest structure again.
+  const src = [
+    `apiVersion: batch/v1`, `kind: Job`, `metadata:`, `  name: migrate`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: runner`,
+    `        args:`,
+    `        - |`,
+    `          set -e`,
+    `{{- if .Values.debug }}`,
+    `          env:`,
+    `          - name: DB_PASSWORD`,
+    `            valueFrom:`,
+    `              secretKeyRef:`,
+    `                name: prod-db-creds`,
+    `{{- end }}`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(
+    doc!.references.find((r) => (r.name as { value?: string }).value === "prod-db-creds"),
+    undefined,
+    "a column-0 template action must not terminate the block-scalar skip",
+  );
+});
+
+test("`- |-` and `- >` headers and deeper-indented args items are both recognized as block scalars", () => {
+  // Both real-world YAML list styles: list items at the SAME indent as their
+  // key (the tests above) and DEEPER than it (here), with chomping and folded
+  // headers rather than a plain `|`.
+  const src = [
+    `apiVersion: batch/v1`, `kind: Job`, `metadata:`, `  name: migrate`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: runner`,
+    `        args:`,
+    `          - |-`,
+    `            env:`,
+    `            - name: A`,
+    `              valueFrom:`,
+    `                secretKeyRef:`,
+    `                  name: scripted-a`,
+    `          - >`,
+    `            env:`,
+    `            - name: B`,
+    `              valueFrom:`,
+    `                secretKeyRef:`,
+    `                  name: scripted-b`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.deepEqual(doc!.references.filter((r) => r.refKind === "Secret"), [], "neither block-scalar body contributes a reference");
+});
+
+test("a `- |` header carrying a trailing comment is still recognized as a block scalar", () => {
+  const src = [
+    `apiVersion: batch/v1`, `kind: Job`, `metadata:`, `  name: migrate`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: runner`,
+    `        args:`,
+    `        - | # entrypoint script`,
+    `          env:`,
+    `          - name: A`,
+    `            valueFrom:`,
+    `              secretKeyRef:`,
+    `                name: scripted-a`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.deepEqual(doc!.references.filter((r) => r.refKind === "Secret"), []);
+});
+
+// Issue #297 gap 3: a key written with NO value (`tier:`) creates a frame but
+// never an entry, so a flat selector/labels map came back MINUS that key --
+// matching strictly MORE workloads than the manifest actually says.
+
+test("a Service selector containing a value-less key resolves to null, not to the map minus that key", () => {
+  const src = [
+    `apiVersion: v1`, `kind: Service`, `metadata:`, `  name: my-service`,
+    `spec:`, `  selector:`, `    tier:`, `    app: web`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.selector, null, "a selector short one key is more permissive than the real one -- must not resolve");
+});
+
+test("a workload's pod-template labels containing a value-less key resolves to null", () => {
+  const src = [
+    `apiVersion: apps/v1`, `kind: Deployment`, `metadata:`, `  name: my-app`,
+    `spec:`, `  template:`, `    metadata:`, `      labels:`,
+    `        tier:`, `        app: web`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.labels, null);
+});
+
+test("a value-less selector key whose line carries a trailing comment is still treated as value-less", () => {
+  const src = [
+    `apiVersion: v1`, `kind: Service`, `metadata:`, `  name: my-service`,
+    `spec:`, `  selector:`, `    tier: # todo: pick one`, `    app: web`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.selector, null, "stripTrailingComment leaves an empty value, which is still value-less");
+});
+
+test("a quoted empty selector value stays a literal empty string, not a value-less key", () => {
+  // Regression guard for the value-less rule: `tier: ""` is a real, explicit
+  // empty-string label value that a workload can genuinely carry, and it must
+  // keep resolving -- only a key with NO value at all voids the map.
+  const src = [
+    `apiVersion: v1`, `kind: Service`, `metadata:`, `  name: my-service`,
+    `spec:`, `  selector:`, `    tier: ""`, `    app: web`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.deepEqual(doc!.selector, { tier: "", app: "web" });
+});
+
+// Issue #297 gap 4: per YAML, `---` followed by whitespace starts a document
+// whatever trails it -- a tag, an anchor -- not only a comment.
+
+test("a `--- !!map` tagged separator splits the file into two documents", () => {
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`, `metadata:`, `  name: cm-one`,
+    `--- !!map`,
+    `apiVersion: v1`, `kind: Secret`, `metadata:`, `  name: sec-one`, ``,
+  ].join("\n");
+  const docs = extractK8sManifest(src);
+  assert.equal(docs.length, 2);
+  assert.equal((docs[0]!.resource!.name as { value: string }).value, "cm-one");
+  assert.equal((docs[1]!.resource!.name as { value: string }).value, "sec-one");
+});
+
+test("a `--- &anchor` anchored separator splits the file into two documents", () => {
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`, `metadata:`, `  name: cm-one`,
+    `--- &base`,
+    `apiVersion: v1`, `kind: Secret`, `metadata:`, `  name: sec-one`, ``,
+  ].join("\n");
+  const docs = extractK8sManifest(src);
+  assert.equal(docs.length, 2);
+  assert.equal((docs[0]!.resource!.name as { value: string }).value, "cm-one");
+  assert.equal((docs[1]!.resource!.name as { value: string }).value, "sec-one");
+});
+
+test("a `----` rule line still does not split the file, even with the relaxed separator", () => {
+  // Regression guard: the dashes must be followed by whitespace or end of
+  // line, so a four-dash rule is still not a document marker.
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`, `metadata:`, `  name: cm-one`,
+    `----`, ``,
+  ].join("\n");
+  assert.equal(extractK8sManifest(src).length, 1);
+});
+
+test("an indented `--- !!map` inside a block-scalar body does not split the file", () => {
+  // Regression guard: the separator is anchored to column 0, so manifest-
+  // looking text embedded in a ConfigMap's data: block scalar stays inert.
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`, `metadata:`, `  name: my-config`,
+    `data:`, `  embedded.yaml: |`,
+    `    --- !!map`,
+    `    kind: Deployment`, ``,
+  ].join("\n");
+  const docs = extractK8sManifest(src);
+  assert.equal(docs.length, 1, "an indented tagged separator is block-scalar text, not a document boundary");
+  assert.equal(docs[0]!.resource?.kind, "ConfigMap");
+});
