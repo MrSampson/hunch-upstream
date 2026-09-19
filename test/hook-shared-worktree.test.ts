@@ -475,3 +475,178 @@ test("21. a relative core.hooksPath in a worktree is per-checkout, not shared", 
     assert.deepEqual(sharedHooksNote(f.wt, [h]), ["  ✓ linked worktree — sharing the repo's memory"]);
   } finally { f.cleanup(); }
 });
+
+test("22. a worktree re-run that ADDS one option and omits another writes the union, never refusing the add", () => {
+  const f = fixture();
+  try {
+    installPostCommitHook(f.main, f.global, { commit: true });
+
+    // `hunch private` from the worktree, without --auto-commit: asks for
+    // --private + the local-only provider line, and does not ask for --commit.
+    const h = installPostCommitHook(f.wt, f.local, { private: true, localOnly: true });
+    const text = read(f.main, "post-commit");
+    assert.match(text, /sync --from-hook --quiet --private --commit /, "the requested --private is written AND the shared --commit survives");
+    assert.match(text, /^ {2}export HUNCH_SYNTH_PROVIDER=deterministic$/m, "the local-only provider line the private mode needs is written");
+    assert.ok(text.includes(f.global), "the block still runs the global launcher");
+    assert.ok(!text.includes(f.wt), "the worktree path never reaches the shared hook");
+    assert.equal(h.action, "updated");
+    assert.equal(h.sharedInvocation, f.global);
+    assert.deepEqual(h.addedFlags, ["--private", "HUNCH_SYNTH_PROVIDER=deterministic"]);
+    assert.deepEqual(h.keptFlags, ["--commit"]);
+
+    // Idempotent: the same re-run now changes nothing and still says what it kept.
+    const again = installPostCommitHook(f.wt, f.local, { private: true, localOnly: true });
+    assert.equal(again.action, "kept-shared");
+    assert.deepEqual(again.keptFlags, ["--commit"]);
+    assert.equal(again.addedFlags, undefined, "nothing was added the second time");
+    assert.equal(read(f.main, "post-commit"), text);
+  } finally { f.cleanup(); }
+});
+
+test("23. a worktree re-run never removes the shared block's local-only provider line", () => {
+  const f = fixture();
+  try {
+    installPostCommitHook(f.main, f.global, { private: true, localOnly: true });
+    const before = read(f.main, "post-commit");
+
+    // Adds --commit, does not ask for local-only: the line forcing the
+    // deterministic provider is a privacy promise, not this run's to withdraw.
+    const h = installPostCommitHook(f.wt, f.local, { private: true, commit: true });
+    const text = read(f.main, "post-commit");
+    assert.equal(h.action, "updated");
+    assert.match(text, /sync --from-hook --quiet --private --commit /);
+    assert.match(text, /^ {2}export HUNCH_SYNTH_PROVIDER=deterministic$/m, "the provider line survives an add");
+    assert.deepEqual(h.addedFlags, ["--commit"]);
+    assert.deepEqual(h.keptFlags, ["HUNCH_SYNTH_PROVIDER=deterministic"], "the kept provider line is reported, not silent");
+
+    // Hand-added quotes are still the same promise.
+    writeFileSync(hookFile(f.main, "post-commit"), before.replace("=deterministic", '="deterministic"'));
+    installPostCommitHook(f.wt, f.local, { private: true, commit: true });
+    assert.match(read(f.main, "post-commit"), /^ {2}export HUNCH_SYNTH_PROVIDER=deterministic$/m);
+
+    // A plain re-run keeps everything, byte for byte.
+    writeFileSync(hookFile(f.main, "post-commit"), before);
+    const plain = installPostCommitHook(f.wt, f.local);
+    assert.equal(plain.action, "kept-shared");
+    assert.deepEqual(plain.keptFlags, ["--private", "HUNCH_SYNTH_PROVIDER=deterministic"]);
+    assert.equal(read(f.main, "post-commit"), before);
+  } finally { f.cleanup(); }
+});
+
+test("24. formatHookInstall says which options a shared block gained and which it kept", () => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "hunch-wt316-fmt-")));
+  try {
+    const h: HookInstall = { path: join(root, "post-commit"), action: "updated", sharedInvocation: "node /g/cli/index.js", addedFlags: ["--private"], keptFlags: ["--commit"] };
+    assert.deepEqual(
+      formatHookInstall(root, "post-commit hook", h, " (learning loop) — syncs to the shared overlay"),
+      ["  ✓ post-commit hook updated — runs the repo's shared Hunch (node /g/cli/index.js), not this worktree's — added --private, kept its existing --commit (a worktree re-run adds options, never removes them) — to change its options, re-run `hunch init` with a Hunch that is not inside a linked worktree (a global install, or the main checkout's)"],
+      "the requested detail is dropped: it no longer describes the whole block",
+    );
+    assert.deepEqual(
+      formatHookInstall(root, "pre-commit constraint guard", { path: join(root, "pre-commit"), action: "updated", sharedInvocation: "node /g/cli/index.js", addedFlags: ["--strict"] }, " (strict)"),
+      ["  ✓ pre-commit constraint guard updated (strict) — runs the repo's shared Hunch (node /g/cli/index.js), not this worktree's — added --strict (a worktree re-run adds options, never removes them)"],
+      "with nothing kept, the requested detail is still the truth",
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("25. a shared block with no closing marker is reported, never passed off as kept or unchanged", () => {
+  const f = fixture();
+  try {
+    installPostCommitHook(f.main, f.global, { commit: true });
+    const broken = read(f.main, "post-commit").replace("# <<< hunch post-commit <<<\n", "");
+    writeFileSync(hookFile(f.main, "post-commit"), broken);
+
+    // From the worktree, asking for an option the block lacks: it cannot land.
+    const h = installPostCommitHook(f.wt, f.local, { private: true, localOnly: true });
+    assert.equal(h.action, "unreachable");
+    assert.equal(h.stale, true);
+    assert.match(h.reason ?? "", /no closing `# <<< hunch post-commit <<<` line/);
+    assert.match(h.snippet ?? "", /sync --from-hook --quiet --private --commit /, "the snippet is the union on the shared launcher");
+    assert.ok((h.snippet ?? "").includes(f.global) && !(h.snippet ?? "").includes(f.wt));
+    assert.equal(read(f.main, "post-commit"), broken, "nothing was written");
+    assert.match(formatHookInstall(f.wt, "post-commit hook", h, " (learning loop)")[0]!, /^ {2}⚠ post-commit hook NOT updated/);
+
+    // Asking for nothing new leaves it alone and says only what is true.
+    const plain = installPostCommitHook(f.wt, f.local);
+    assert.equal(plain.action, "kept-shared");
+    assert.deepEqual(plain.keptFlags, ["--commit"]);
+
+    // The same truncation in the MAIN checkout's own re-run is not "unchanged".
+    const own = installPostCommitHook(f.main, f.global, { commit: true, private: true });
+    assert.equal(own.action, "unreachable");
+    assert.equal(read(f.main, "post-commit"), broken);
+  } finally { f.cleanup(); }
+});
+
+test("26. a re-run that adds nothing never rewrites the shared block, and an add keeps every line's options", () => {
+  const f = fixture();
+  try {
+    // A strict guard someone softened by hand: an advisory re-run must not
+    // bring the blocking form back.
+    installPreCommitHook(f.main, f.global, true);
+    const softened = read(f.main, "pre-commit").replace("check --staged --strict", "check --staged --strict || true");
+    writeFileSync(hookFile(f.main, "pre-commit"), softened);
+    const p = installPreCommitHook(f.wt, f.local, false);
+    assert.equal(p.action, "kept-shared");
+    assert.equal(read(f.main, "pre-commit"), softened);
+    // Nor a STRICT re-run: it asks for nothing the block lacks, so the hand-shaped
+    // line is not the run's to rewrite.
+    const again = installPreCommitHook(f.wt, f.local, true);
+    assert.equal(again.action, "kept-shared");
+    assert.equal(read(f.main, "pre-commit"), softened);
+
+    // Options on a hand-added SECOND command line are merged into the rebuilt
+    // block rather than dropped with the line.
+    installPostCommitHook(f.main, f.global);
+    const line = read(f.main, "post-commit").split("\n").find((l) => l.includes("sync --from-hook"))!;
+    writeFileSync(hookFile(f.main, "post-commit"), read(f.main, "post-commit").replace(line, `${line}\n${line.replace("--quiet", "--quiet --commit")}`));
+    const h = installPostCommitHook(f.wt, f.local, { private: true });
+    assert.equal(h.action, "updated");
+    assert.deepEqual(h.keptFlags, ["--commit"]);
+    assert.match(read(f.main, "post-commit"), /sync --from-hook --quiet --private --commit /);
+  } finally { f.cleanup(); }
+});
+
+test("27. rebuilding a stale own block from a sibling's launcher names a dropped local-only provider line", () => {
+  const f = fixture();
+  try {
+    // A private, local-only post-commit block whose global install then vanishes,
+    // plus a healthy pre-commit sibling to rebuild from.
+    installPostCommitHook(f.main, f.global2, { private: true, localOnly: true });
+    installPreCommitHook(f.main, f.global);
+    rmSync(f.global2Entry, { force: true });
+
+    const h = installPostCommitHook(f.wt, f.local);
+    assert.equal(h.action, "updated");
+    assert.equal(h.sharedInvocation, f.global);
+    assert.deepEqual(h.droppedFlags, ["--private", "HUNCH_SYNTH_PROVIDER=deterministic"], "the privacy promise went — say so");
+    assert.match(formatHookInstall(f.wt, "post-commit hook", h, " (learning loop)").join("\n"), /HUNCH_SYNTH_PROVIDER=deterministic/);
+  } finally { f.cleanup(); }
+});
+
+test("28. only a WORKING command line's options count as carried by the shared block", () => {
+  const f = fixture();
+  try {
+    // A dead hand-kept line's --commit was never in effect: an add must not
+    // switch auto-commit on and call it "kept".
+    installPostCommitHook(f.main, f.global);
+    const line = read(f.main, "post-commit").split("\n").find((l) => l.includes("sync --from-hook"))!;
+    const dead = line.replace(f.global, `${JSON.stringify(process.execPath)} ${JSON.stringify(join(f.base, "gone", "dist", "cli", "index.js"))}`).replace("--quiet", "--quiet --commit");
+    writeFileSync(hookFile(f.main, "post-commit"), read(f.main, "post-commit").replace(line, `${dead}\n${line}`));
+    const h = installPostCommitHook(f.wt, f.local, { private: true });
+    assert.equal(h.action, "updated");
+    assert.equal(h.keptFlags, undefined);
+    assert.doesNotMatch(read(f.main, "post-commit"), /--commit/);
+
+    // An unclosed block stops at the next Hunch marker: another tool's line
+    // further down is not this block's option.
+    installPreCommitHook(f.main, f.global, false);
+    const open = `${read(f.main, "pre-commit").replace("# <<< hunch pre-commit <<<\n", "")}# >>> hunch something-else >>>\n${f.global} check --staged --strict\n`;
+    writeFileSync(hookFile(f.main, "pre-commit"), open);
+    const p = installPreCommitHook(f.wt, f.local, false);
+    assert.equal(p.action, "kept-shared");
+    assert.equal(p.keptFlags, undefined);
+    assert.equal(read(f.main, "pre-commit"), open);
+  } finally { f.cleanup(); }
+});
