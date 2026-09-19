@@ -359,3 +359,19 @@ test("PostToolUse records every file an apply_patch touched for the Stop gate", 
   const state = loadPipelineState(session);
   assert.deepEqual([...state.editedFiles].sort(), ["src/billing/charge.ts", "src/old.ts", "src/other.ts", "src/renamed.ts"]);
 });
+
+test("PostToolUse skips files outside the repository — a scratch edit is not a product edit (#305)", { timeout: 120_000 }, t => {
+  const root = patchRepo(t, [], "advisory");
+  const outside = mkdtempSync(join(tmpdir(), "hunch-codex-scratch-"));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const session = `codex-post-outside-${process.pid}-${Date.now()}`;
+  codexHook(root, {
+    hook_event_name: "PostToolUse", session_id: session, tool_name: "apply_patch",
+    tool_input: { input: patchOf(
+      `*** Update File: ${join(outside, "probe.mts")}`, "@@", "+a",
+      "*** Update File: src/other.ts", "@@", "+b",
+    ) },
+    tool_response: { output: "Success" },
+  }, { HUNCH_PIPELINE: "1" });
+  assert.deepEqual([...loadPipelineState(session).editedFiles], ["src/other.ts"], "only the in-repo file is recorded for the Stop gate");
+});

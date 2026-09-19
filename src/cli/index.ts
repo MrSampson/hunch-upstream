@@ -4519,9 +4519,11 @@ program
         if (/^(Edit|Write|MultiEdit)$/.test(evt.tool_name ?? "")) {
           // A Codex apply_patch touches every file it lists (and each Move-to
           // destination); the Stop gate must see all of them, not only the first.
-          const patchPaths = evt.tool_input?.patch_files?.flatMap((f) => f.moved_to ? [f.path, f.moved_to] : [f.path]);
-          const edited = patchPaths?.length ? patchPaths : evt.tool_input?.file_path ? [evt.tool_input.file_path] : [];
-          for (const p of edited) st = onEdit(st, toRepoRel(root, p));
+          // Same in-repo filter as the pre-edit path: a scratch file outside the
+          // repository is not a product edit, and recording it would block Stop on
+          // a path no check can ever verify.
+          const edited = editTargets(root, evt.tool_input);
+          for (const e of edited) st = onEdit(st, e.target);
           if (edited.length) activity = { kind: "edit" };
         } else if (evt.tool_name === "Bash" || evt.tool_name === "PowerShell") {
           const command = String(evt.tool_input?.command ?? "");
