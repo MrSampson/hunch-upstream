@@ -142,6 +142,59 @@ test("installClaudeHooks preserves foreign hooks and other settings", () => {
   }
 });
 
+test("installClaudeHooks keeps the user's command out of a MIXED entry (issue #310)", () => {
+  const root = tmpRoot();
+  try {
+    const file = join(root, ".claude", "settings.json");
+    const stale = `"node" "/old/dist/cli/index.js" hook`;
+    const mine = "/usr/local/bin/my-guard.sh";
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    // One entry holding BOTH Hunch's hook and the user's own command.
+    writeFileSync(file, JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          matcher: "Edit|Write|MultiEdit",
+          hooks: [{ type: "command", command: stale }, { type: "command", command: mine }],
+        }],
+      },
+    }, null, 2));
+
+    const cmd = `"node" "/new/dist/cli/index.js" hook`;
+    installClaudeHooks(root, cmd);
+
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    const all = j.hooks.PreToolUse.flatMap((e: { hooks: { command: string }[] }) => e.hooks.map((h) => h.command));
+    assert.equal(all.filter((c: string) => c === mine).length, 1, "the user's command survives exactly once");
+    assert.equal(all.filter((c: string) => c === cmd).length, 1, "Hunch's hook is present exactly once");
+    assert.ok(!all.includes(stale), "the stale Hunch command is gone");
+    const kept = j.hooks.PreToolUse.find((e: { hooks: { command: string }[] }) => e.hooks.some((h) => h.command === mine));
+    assert.equal(kept.matcher, "Edit|Write|MultiEdit", "the user's entry keeps its matcher");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("installClaudeHooks preserves a FOREIGN …/dist/cli/index.js hook (issue #310)", () => {
+  const root = tmpRoot();
+  try {
+    const file = join(root, ".claude", "settings.json");
+    const foreign = "node tools/lint/dist/cli/index.js hook";
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "Edit", hooks: [{ type: "command", command: foreign }] }] },
+    }, null, 2));
+
+    installClaudeHooks(root, `"node" "/abs/dist/cli/index.js" hook`);
+
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    const all = j.hooks.PreToolUse.flatMap((e: { hooks: { command: string }[] }) => e.hooks.map((h) => h.command));
+    assert.ok(all.includes(foreign), "an unrelated tool's index.js hook is not ours to delete");
+    assert.equal(j.hooks.PreToolUse.length, 2, "Hunch entry added alongside the foreign one");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("installClaudeHooks refuses to clobber an unparseable settings.json", () => {
   const root = tmpRoot();
   try {
