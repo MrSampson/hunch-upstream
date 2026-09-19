@@ -1281,10 +1281,13 @@ export class HunchStore {
     return hits;
   }
 
-  /** The ONE definition of "is `t` a real path?" — the gate that decides whether a
-   *  target may fall through to segment-anchored suffix matching. Every matcher in
-   *  this file (and `resolveSymbols` in the MCP server) asks it exactly this way so
-   *  they cannot drift apart on the same question.
+  /** The WIDE definition of "is `t` a real path?" — the gate used by the matchers
+   *  that ATTRIBUTE records to a target silently (why(), liveFindingsFor, tasksFor,
+   *  `resolveSymbols` in the MCP server). They also run for a file an agent is
+   *  about to create, where the covering component glob is the only signal there
+   *  is, so the answer must not depend on the file already being on disk. The
+   *  resolvers that NAME the file they resolved to (resolveNodeIds, structure())
+   *  deliberately use the narrower `isRepoFile` instead.
    *
    *  Graph data FIRST (a symbol's exact file, or an indexed component's path glob),
    *  so a deleted-but-still-indexed path and a time-travel (`asOf`) query answer the
@@ -1475,10 +1478,20 @@ export class HunchStore {
    *  to graph node ids — symbols win over components, exact file before suffix.
    *  Shares why()/resolveSymbols' tiered matcher rather than one un-tiered SQL OR:
    *  the flat query matched every tier at once, so a root `index.ts` also returned
-   *  `a/index.ts`'s symbols, and an absolute target matched nothing at all (#335). */
+   *  `a/index.ts`'s symbols, and an absolute target matched nothing at all (#335).
+   *
+   *  The suffix gate here is `isRepoFile`, NOT the wider `isKnownPath`: the
+   *  exact-file tier has already run, so the only case left is a real on-disk file
+   *  with zero symbols (#334). Glob coverage alone would wrongly block a target
+   *  that no file actually carries — with a `src/**` component, `src/x.ts` living
+   *  at `packages/a/src/x.ts` stopped resolving. This resolver names the file it
+   *  resolved to in its result, so a suffix resolution is visible and only a file
+   *  that really exists may block it; why()/the pre-edit hook attribute records
+   *  silently and also run for a file about to be created, so they keep the wider
+   *  `isKnownPath`. */
   resolveNodeIds(target: string): string[] {
     const t = repoRelativeTarget(target, this.paths.root);
-    const sym = matchSymbolsTiered(t, this.recs("symbols"), this.isKnownPath(t)).slice(0, 20);
+    const sym = matchSymbolsTiered(t, this.recs("symbols"), isRepoFile(this.paths.root, t)).slice(0, 20);
     if (sym.length) return sym.map((r) => r.id);
     const cmp = this.db.prepare(`SELECT id FROM components WHERE id = ? OR name = ? LIMIT 5`).all(t, t) as Array<{ id: string }>;
     return cmp.map((r) => r.id);
@@ -1539,13 +1552,20 @@ export class HunchStore {
     const fileRows = this.db.prepare(
       `SELECT id, name, kind, loc, fan_in, fan_out FROM symbols WHERE file = ? ORDER BY fan_in DESC, name`,
     ).all(t) as Array<{ id: string; name: string; kind: string; loc: number; fan_in: number; fan_out: number }>;
-    // Only the SUFFIX fallback is gated: a target that is itself a real path names
-    // exactly one file, so resolving it by suffix would serve an unrelated
-    // same-basename file's outline (#299/#334). Exact-path, directory and symbol
-    // tiers are untouched — a directory is deliberately not a "known path" here.
+    // Only the SUFFIX fallback is gated, and by `isRepoFile` rather than the wider
+    // `isKnownPath`: the exact-path tier above has already run, so the only case
+    // left is a real on-disk file with zero symbols, whose outline must not come
+    // from an unrelated same-basename file (#334). Glob coverage alone is not
+    // existence — with a `src/**` component, `src/x.ts` living at
+    // `packages/a/src/x.ts` would stop resolving. structure() names the file it
+    // resolved to, so a suffix resolution is visible and only a file that really
+    // exists may block it; why()/the pre-edit hook attribute records silently and
+    // also run for a file about to be created, so they keep `isKnownPath`.
+    // Directory targets are unaffected — a directory is never an `isRepoFile`
+    // (regular files only), so they keep flowing to the dir tier below.
     const fileHit = fileRows.length
       ? t
-      : this.isKnownPath(t)
+      : isRepoFile(this.paths.root, t)
         ? []
         : (this.db.prepare(`SELECT DISTINCT file FROM symbols WHERE file LIKE ?`).all(`%/${t}`) as Array<{ file: string }>).map((r) => r.file);
     const file = typeof fileHit === "string" ? fileHit : fileHit.length === 1 ? fileHit[0]! : null;
@@ -1582,7 +1602,10 @@ export class HunchStore {
         matches: named.map((m) => ({ ...m, callers: this.edgeNeighbors(m.id, "in", 6), callees: this.edgeNeighbors(m.id, "out", 6) })),
       };
     }
-    return { kind: "none", target: t };
+    // A real on-disk file with zero indexed symbols reaches "none" too (#334). Flag
+    // it so the renderer doesn't tell the user it isn't a known file when we just
+    // stat'd it.
+    return { kind: "none", target: t, ...(isRepoFile(this.paths.root, t) ? { realFile: true } : {}) };
   }
 
   /** Labelled one-hop edge neighbors of a node ("in" = who reaches it, "out" = what it reaches). */
@@ -2242,7 +2265,9 @@ export type StructureView =
   | { kind: "dir"; dir: string; files: Array<{ file: string; symbols: Array<{ name: string; kind: string; fan_in: number }> }> }
   | { kind: "file"; file: string; symbols: Array<{ id: string; name: string; kind: string; loc: number; fan_in: number; fan_out: number; callers: string[] }> }
   | { kind: "symbol"; matches: Array<{ id: string; name: string; kind: string; file: string; fan_in: number; fan_out: number; callers: string[]; callees: string[] }> }
-  | { kind: "none"; target: string };
+  /** `realFile`: the target IS a regular file in the working tree, it just has no
+   *  indexed symbols — a different answer from "no such path" (#334). */
+  | { kind: "none"; target: string; realFile?: boolean };
 
 export interface StaleRecord {
   kind: string;

@@ -1078,7 +1078,13 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
       const all = new Map<string, { id: string; depth: number; via: string }>();
       for (const id of ids) for (const d of store.getDependents(id)) if (!all.has(d.id)) all.set(d.id, d);
       const deps = [...all.values()].sort((a, b) => a.depth - b.depth);
-      if (!deps.length) return ok(`Nothing depends on "${symbol}" (leaf node, or not indexed).`);
+      // A real path the index has no symbols for reaches here too (resolveSymbols
+      // correctly refuses to suffix-resolve it, #334) — don't tell the caller a
+      // path we can confirm is real "isn't indexed".
+      if (!deps.length) {
+        const known = store.isKnownPath(repoRelativeTarget(symbol, store.publicRoot));
+        return ok(`Nothing depends on "${symbol}" (${known ? "leaf node, or no indexed symbols for it" : "leaf node, or not indexed"}).`);
+      }
       // Nearest dependents first (sorted by depth); cap the tail so a high-fan-in
       // symbol can't flood the session context.
       const lines = deps.slice(0, DEP_CAP).map((d) => `  • [depth ${d.depth}] ${d.via} (${d.id})`);

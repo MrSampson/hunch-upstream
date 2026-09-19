@@ -106,6 +106,44 @@ test("resolveNodeIds: a bare basename that exists ONLY nested still suffix-resol
   } finally { cleanup(); }
 });
 
+test("resolveNodeIds: a real on-disk file with zero indexed symbols resolves to nothing, never a same-basename nested file (issue #334)", () => {
+  const root = fixtureRepo();
+  mkdirSync(join(root, "a"), { recursive: true });
+  writeFileSync(join(root, "empty.ts"), "// only a comment — no symbols at all\n");
+  writeFileSync(join(root, "a/empty.ts"), `export function nestedEmpty(){ return 1; }\n`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+  try {
+    const nested = store.json.loadAll("symbols").filter((s) => s.file === "a/empty.ts").map((s) => s.id).sort();
+    assert.ok(nested.length, "fixture indexed the nested file");
+    assert.deepEqual(store.resolveNodeIds("empty.ts"), [], "the real root file must not pull a/empty.ts's symbols");
+    assert.deepEqual(store.resolveNodeIds("a/empty.ts").sort(), nested, "the nested file still resolves exactly");
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("resolveNodeIds: a glob-covered path that no file occupies still suffix-resolves — coverage is not existence", () => {
+  // Symbols in test/a.test.ts derive a `test/**` component, so `test/util.ts` is
+  // "known" to isKnownPath although nothing is on disk there. Gating the suffix
+  // tier on coverage rather than existence made the target resolve to nothing.
+  const root = mkdtempSync(join(tmpdir(), "hunch-impact-phantom-"));
+  mkdirSync(join(root, "test"), { recursive: true });
+  mkdirSync(join(root, "src/test"), { recursive: true });
+  writeFileSync(join(root, "test/a.test.ts"), `export function aTest(){ return 1; }\n`);
+  writeFileSync(join(root, "src/test/util.ts"), `export function util(){ return 2; }\n`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+  try {
+    assert.equal(store.isKnownPath("test/util.ts"), true, "the test/** component covers it");
+    const target = store.json.loadAll("symbols").filter((s) => s.file === "src/test/util.ts").map((s) => s.id).sort();
+    assert.ok(target.length, "fixture indexed src/test/util.ts");
+    assert.deepEqual(store.resolveNodeIds("test/util.ts").sort(), target, "the suffix tier must still run");
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("prImpact composes blast radius + constraints + decisions for a change", () => {
   const { store, fileOf, cleanup } = indexed();
   try {

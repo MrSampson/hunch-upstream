@@ -70,7 +70,13 @@ export function repoRelativeTarget(target: string, root: string): string {
  *  target escaping `root` via ".." are rejected rather than resolved — the
  *  caller has already run `repoRelativeTarget`, so anything still absolute is
  *  outside the repo. A DIRECTORY is false: directory targets must keep flowing
- *  to `structure()`'s dir tier. Any fs error (missing, EACCES, ...) → false. */
+ *  to `structure()`'s dir tier. Any fs error (missing, EACCES, ...) → false.
+ *
+ *  Containment is checked twice: lexically, then again on the REALPATHS. `statSync`
+ *  follows symlinks, so an in-repo `link -> /outside` would otherwise make
+ *  `isRepoFile(root, "link/secret.ts")` true and turn this into a one-bit existence
+ *  oracle for paths outside the repo. A symlinked file pointing at another file
+ *  INSIDE the repo stays true. */
 export function isRepoFile(root: string, target: string): boolean {
   const t = toPosixTarget(target);
   if (!t || isAbsolute(t) || /^[a-zA-Z]:/.test(t)) return false;
@@ -78,7 +84,9 @@ export function isRepoFile(root: string, target: string): boolean {
   const rel = relative(resolve(root), abs);
   if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
   try {
-    return statSync(abs).isFile();
+    if (!statSync(abs).isFile()) return false;
+    const realRel = relative(realpathNorm(resolve(root)), realpathSync.native(abs));
+    return !!realRel && realRel !== ".." && !realRel.startsWith(`..${sep}`) && !isAbsolute(realRel);
   } catch {
     return false;
   }

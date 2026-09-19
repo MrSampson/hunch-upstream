@@ -91,8 +91,11 @@ export function isIndexedPath(
  *  (only when `target` is NOT a path already known to be real) segment-anchored
  *  suffix. A real file with zero symbols must return [] rather than fall through
  *  to the suffix tier, which would leak an unrelated same-basename file's records
- *  (issues #299/#334) — callers compute `indexed` via `HunchStore.isKnownPath`
- *  first so the "is this a real path" question is answered identically everywhere. */
+ *  (issues #299/#334). Callers decide what counts as "real": one that ATTRIBUTES
+ *  records silently (why(), the pre-edit hook) passes `HunchStore.isKnownPath`, the
+ *  wider graph-or-working-tree answer that also covers a file about to be created;
+ *  one that NAMES the file it resolved to (resolveNodeIds, structure()) passes the
+ *  narrower `isRepoFile`, since glob coverage alone is not existence. */
 export function matchSymbolsTiered<S extends { id: string; file: string; name: string }>(
   target: string,
   symbols: readonly S[],

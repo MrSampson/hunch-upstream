@@ -116,3 +116,42 @@ test("structure(): a real root file with zero symbols must not serve a same-base
   assert.equal(nested.kind, "file");
   if (nested.kind === "file") assert.ok(nested.symbols.some((s) => s.name === "nestedEmpty"));
 });
+
+test("structure(): a real symbol-less file reports kind:none with realFile, and renders as a real file rather than an unknown path (issue #334)", (t) => {
+  const { store, cleanup } = indexedWithEmptyRootFile();
+  t.after(cleanup);
+  const v = store.structure("empty.ts");
+  assert.equal(v.kind, "none", "no symbols to outline");
+  assert.equal(v.kind === "none" ? v.realFile : undefined, true, "but the file itself is real");
+  const rendered = formatStructure(v);
+  assert.match(rendered, /real file/, "the message must say so");
+  assert.doesNotMatch(rendered, /not a known file/, "and must never claim a file we just stat'd doesn't exist");
+  // An actually-unknown target keeps the original message.
+  assert.match(formatStructure(store.structure("no_such_path_xyz.ts")), /not a known file/);
+});
+
+/** A component `paths` glob covers a path no file actually occupies: with symbols
+ *  in `test/a.test.ts` and `src/test/util.ts`, the derived `test/**` component
+ *  makes `test/util.ts` look "known" although nothing is there. Gating the suffix
+ *  tier on glob coverage rather than on-disk existence killed the resolution. */
+function indexedWithGlobPhantom() {
+  const root = mkdtempSync(join(tmpdir(), "hunch-structure-phantom-"));
+  mkdirSync(join(root, "test"), { recursive: true });
+  mkdirSync(join(root, "src/test"), { recursive: true });
+  writeFileSync(join(root, "test/a.test.ts"), `export function aTest(){ return 1; }\n`);
+  writeFileSync(join(root, "src/test/util.ts"), `export function util(){ return 2; }\n`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+  return { store, root, cleanup: () => { store.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+test("structure(): a glob-covered path that no file occupies still suffix-resolves — coverage is not existence", (t) => {
+  const { store, cleanup } = indexedWithGlobPhantom();
+  t.after(cleanup);
+  assert.equal(store.isKnownPath("test/util.ts"), true, "the test/** component covers it, so isKnownPath says 'known'");
+  const v = store.structure("test/util.ts");
+  assert.equal(v.kind, "file", "but nothing is on disk there, so the suffix tier must still run");
+  assert.equal(v.kind === "file" ? v.file : null, "src/test/util.ts");
+});

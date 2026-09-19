@@ -109,3 +109,33 @@ test("isRepoFile: a real regular file inside root is true; a directory, a missin
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("isRepoFile: an in-repo symlink pointing OUTSIDE the root is false — statSync follows links, so lexical containment alone is an existence oracle", { skip: SYMLINK_SKIP }, () => {
+  const base = mkdtempSync(join(tmpdir(), "hunch-isrepofile-symlink-"));
+  try {
+    const root = join(base, "repo");
+    const outside = join(base, "outside");
+    mkdirSync(root, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "secret.ts"), "export const secret = 1;\n");
+    symlinkSync(outside, join(root, "link"));
+    // "link/secret.ts" is lexically inside root and statSync says it's a file, but
+    // the real target is outside — answering true would leak one bit about a path
+    // the caller can't see.
+    assert.equal(isRepoFile(root, "link/secret.ts"), false, "a symlinked dir escaping the root");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("isRepoFile: a symlink to another file INSIDE the root stays true", { skip: SYMLINK_SKIP }, () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-isrepofile-inlink-"));
+  try {
+    mkdirSync(join(root, "a"), { recursive: true });
+    writeFileSync(join(root, "a", "real.ts"), "export function f(){ return 1; }\n");
+    symlinkSync(join(root, "a", "real.ts"), join(root, "alias.ts"));
+    assert.equal(isRepoFile(root, "alias.ts"), true, "the real target is still in the repo");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
