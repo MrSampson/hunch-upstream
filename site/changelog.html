@@ -107,6 +107,10 @@
 
     <div class="clog">
       <div class="clog-group">
+        <div class="clog-date">Sep 19, 2026</div>
+        <div class="clog-row"><span class="rel-tag">v1.39.3</span><span class="clog-t"><b>Keeps what you recorded</b> — reindexing, branch merges and <span class="mono">hunch private migrate</span> keep edges, lifecycle moves and overlay records they used to drop; the grounding tools stop matching the wrong file; stale-lock takeover is serialized and a recycled pid no longer vouches for a dead owner; <span class="mono">hunch task verify</span> settles on the command's own exit and ledger reads stop taking the writer lock; and <span class="mono">hunch doctor</span> reports a git hook whose command is dead instead of calling it installed.</span></div>
+      </div>
+      <div class="clog-group">
         <div class="clog-date">Sep 17, 2026</div>
         <div class="clog-row"><span class="rel-tag">v1.39.2</span><span class="clog-t"><b>Tighter boundaries</b> — state writes stay inside their partition, capture tokens no longer stand in for a human confirmation, <span class="mono">hunch serve</span> keeps internals out of errors and anonymous health checks, Codex output without an exit status no longer counts as a pass, and Windows batch-launcher arguments stay literal.</span></div>
         <div class="clog-row"><span class="rel-tag">v1.39.1</span><span class="clog-t"><b>Safer checks, safer cleanup</b> — constraint checks read the whole change instead of its first 60 KB and fail closed when they cannot, Codex patches are checked file by file, git hooks are no longer installed where husky or pre-commit would never run them, older <span class="mono">.gitignore</span> blocks are brought up to date, shared-state retries replay instead of duplicating, and <span class="mono">hunch workspaces prune</span> no longer deletes relanded branches, untracked work or half a step.</span></div>

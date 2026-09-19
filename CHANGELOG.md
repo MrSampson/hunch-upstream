@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.39.3 — 2026-09-19
+
+- `hunch supersede <old> --by <new>` resolves both decisions in whichever memory home holds them, so it no longer fails with "not found" in shared mode and can close an overlay decision in private mode (#294). Contributed by @MrSampson.
+- `hunch_why`, `hunch_check_constraints`, `hunch_get_dependents`, `hunch_blast_radius` and the pre-edit hook no longer match the wrong file: an absolute path is resolved to its repo-relative form, a bare filename no longer matches a file that merely ends with it (`db.ts` vs `mongodb.ts`), and a nested same-named file (`index.ts`) no longer inherits records scoped to another file of that name (#296, #299, #300). Contributed by @MrSampson.
+- A `<!-- hunch:topic … -->` marker shown as an example inside a code fence is left alone: on a CRLF checkout `hunch drift` and the pre-edit hook no longer report it as a stale or dangling anchor (#298, contributed by @MrSampson), and wiki adoption no longer rewrites it or injects a callout into the fence (#332).
+- Reindexing (`hunch index`, post-commit sync) replaces only the edges the scan can re-derive; `supersedes` edges and human-reviewed Landscape relationships are carried forward instead of deleted (#288).
+- Merging two branches that each moved the same decision's lifecycle (a supersede on one side, a review or accept on the other) keeps both moves instead of silently dropping one (#290).
+- A stray copy of a record file (a mergetool `_BASE_` leftover, an `.orig` backup, a cloud-sync `(1)` duplicate) no longer breaks the index rebuild: it is skipped with a warning when the canonical file exists, and kept with a warning when it is the record's only copy (#291).
+- `hunch private migrate` refuses when the private overlay, not only the public store, holds a record it cannot load, instead of deleting it and pushing the loss (#289).
+- `hunch serve compact` takes the partition's write lock and compacts the resolved state home, so it can no longer overwrite a concurrent writer's event or compact an empty ledger in shared mode (#286).
+- Stale-lock takeover is serialized on both the partition write lock and the index file lock, so two contenders can no longer both judge a lock stale and remove each other's fresh lock; on the same host a recycled pid no longer vouches for a dead owner — ownership is decided by process identity (a boot, namespace and start-time token on Linux), not by comparing clocks. On macOS and Windows a different live process that recycled the owner's pid still blocks (known gap) (#287, #293).
+- A lock release racing a waiter's read of the owner file no longer makes the waiter throw "unsafe or unreadable store artifact"; a vanished owner file reads as "no owner", and every other refusal (hardlink, oversize, symlink) is unchanged.
+- A commit-lock handoff no longer waits out the full handoff timeout (up to 120s) when the lock is briefly owner-less during a normal acquire/release; a stranded owner-less lock is still reclaimed promptly, and a store directory that cannot be created is detected in about 60ms (#295).
+- `hunch task verify` settles on the command's own exit: a command that succeeded but left a background helper holding its output pipes is no longer recorded as `timed_out` (#304), and a finished older check can no longer hide a still-running one and let the task report complete early (#302).
+- Reads of the task ledger (`served.db`) no longer take the writer lock, so parallel hooks, the MCP server and `hunch task verify` stop colliding with "database is locked"; a verification result waits for a competing writer and retries instead of being lost (#303).
+- A subagent's tool calls (deliveries, strict denials) report to the parent prompt's task instead of failing with "task not found" (#306).
+- The PostToolUse hook skips edits to files outside the repository, matching PreToolUse (#305).
+- `hunch init`'s Claude Code hook installer removes only Hunch's own commands: a user command sharing a `settings.json` hook entry with a Hunch command is kept, and an unrelated tool with a similar file layout is no longer taken for a Hunch hook (#310).
+- `hunch doctor` reports a managed git hook as stale, not installed, when its command was rewritten to something foreign or points at a launcher that no longer exists, and shows where each hook points (#315).
+- `hunch workspaces forget <machine>` refuses, with the manual `git rm` recipe, when the record lives in the public git-tracked store, instead of stranding an untracked deletion that broke later auto-commits; overlay records are forgotten as before (#292).
+- A background workspace snapshot defers while a rebase, merge, cherry-pick, revert or bisect is in progress or HEAD is detached, instead of committing onto the checked-out branch and aborting the git operation with "untracked working tree files would be overwritten" (#313).
+- Kubernetes manifest scanner: a script inlined as a `- |` list item under `args:` or `command:` is no longer scanned as manifest fields (a heredoc that mentions a Secret no longer yields a phantom reference), a value-less selector or label key no longer widens a selector match, and a tagged or anchored document separator (`--- !!map`) splits the document (part of #297; namespace-aware matching stays open).
+
 ## 1.39.2 — 2026-09-17
 
 - State writes stay inside their partition. In a store shared by several partitions, a statement in one partition no longer blocks or supersedes another partition's current statement; a supersede target or record id that belongs to another partition is refused; decisions, constraints, bugs and findings are accepted only for the repository partition; and derived reads no longer name unrelated partitions in `denied_scopes` (#324).
