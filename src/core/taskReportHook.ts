@@ -9,6 +9,7 @@ import { isCredentialFreeText } from "./types.js";
 import { aliasReportTask, continuationLinks, finishReportTask, isEmptyTaskReport, latestSessionTask, readTaskReport, recordReportRefusal, reportHash, reportPresentationEnabled, reportTaskExists, resolveReportTask, settleSessionTasks, startReportTask, type TaskLinks } from "./taskReport.js";
 import { reportSourceSnapshot } from "./taskReportEvidence.js";
 import { renderTaskReport } from "./taskReportRender.js";
+import { verificationLauncher } from "./verifyLauncher.js";
 
 /** The exact task identity a native host prompt maps to. */
 export function promptTaskId(root: string, sessionId: string, promptId: string, agentId: string | null = null, provider: HookProvider = "claude"): string {
@@ -18,6 +19,15 @@ export function promptTaskId(root: string, sessionId: string, promptId: string, 
 /** Hosts whose hooks deliver a native per-prompt identity (Claude Code's
  * prompt_id, Codex's turn_id). Others get no task from a hook. */
 const NATIVE_PROMPT_HOSTS: ReadonlySet<HookProvider> = new Set<HookProvider>(["claude", "codex"]);
+
+/** Hosts for which `hunch init` wires a Stop-equivalent hook event, so a task
+ * this host opened is also CLOSED by this host (closeHookTask) and its evidence
+ * shown without the agent's cooperation. Only for these may the instruction make
+ * the agent's finish call conditional: a prompt hook without a stop hook (today
+ * Windsurf's pre_user_prompt, whose config has no stop event at all) would leave
+ * the task open until the session's next prompt settles it, so there finish
+ * stays mandatory. Provider-agnostic by capability, never by host name. */
+const HOST_CLOSES_TASK: ReadonlySet<HookProvider> = new Set<HookProvider>(["claude", "codex", "vscode", "cursor", "antigravity"]);
 const NATIVE_TASK_TITLE = "Assistant task";
 const GENERIC_TASK_TITLES: ReadonlySet<string> = new Set(["Assistant task", "Claude task"]);
 const TASK_TITLE_MAX = 72;
@@ -117,7 +127,7 @@ export function startHookReport(root: string, provider: HookProvider, event: Hun
       // this prompt's Stop and hook observations report to that task.
       if (previous && previous.task_id !== id && isNotificationPrompt(event.prompt) && previous.closed_by !== "agent") {
         aliasReportTask(root, id, previous.task_id);
-        return taskInstruction(previous, cwdLiteral);
+        return taskInstruction(previous, cwdLiteral, provider);
       }
       const continued = previous && previous.task_id !== id ? continuationLinks(previous) : null;
       if (continued) links = { ...links, ...continued };
@@ -133,10 +143,27 @@ export function startHookReport(root: string, provider: HookProvider, event: Hun
     if (existing.title !== title && !GENERIC_TASK_TITLES.has(existing.title) && !GENERIC_TASK_TITLES.has(title)) throw error;
     task = existing;
   }
-  return taskInstruction(task, cwdLiteral);
+  return taskInstruction(task, cwdLiteral, provider);
 }
-function taskInstruction(task: { task_id: string; title: string }, cwdLiteral: string): string {
-  return `Hunch has opened this prompt's report: ${task.task_id}. Reuse this exact ID for this prompt. Call hunch_task(action: "start", task_id: "${task.task_id}", title: ${JSON.stringify(task.title)}, cwd: ${cwdLiteral}) to obtain verification_argv; do not create another report. Pass this task_id and cwd: ${cwdLiteral} to hunch_context and decision/correction/finding captures, and pass the same cwd when finishing with hunch_task before responding. A host Stop notice will show the evidence even if no task-linked memory was observed.`;
+/** The hook already opened the task, so the model needs no start call: the only
+ * thing start used to supply was verification_argv, and the launcher is printed
+ * inline here. Identical in substance for EVERY hook provider that reaches this
+ * function; the one variation is capability-driven, never host-named — where the
+ * host wires no stop event (HOST_CLOSES_TASK) nobody but the next prompt's settle
+ * would close the task, so finish stays mandatory there. Elsewhere finish is
+ * CONDITIONAL: ~87 start/finish round trips a day mostly returned "No task-linked
+ * delivery observed", and the host's Stop hook closes the task and shows the
+ * evidence either way. FAILS OPEN (con_03a0b94b2e): if the launcher cannot be
+ * computed, fall back to asking for the start call. */
+export function taskInstruction(task: { task_id: string; title: string }, cwdLiteral: string, provider: HookProvider, launcher: () => { shell: string } = verificationLauncher): string {
+  const head = `Hunch has already opened this prompt's report: ${task.task_id}, title: ${JSON.stringify(task.title)}. Reuse this exact ID; never open another report or call hunch_task start for it. Pass this task_id and cwd: ${cwdLiteral} to hunch_context and decision/correction/finding captures.`;
+  let verify: string;
+  try { verify = ` For checks, run: ${launcher().shell} task verify ${task.task_id} -- <command> [arguments].`; }
+  catch { return `${head} Call hunch_task(action: "start", task_id: "${task.task_id}", title: ${JSON.stringify(task.title)}, cwd: ${cwdLiteral}) to obtain verification_argv. A host Stop notice will show the evidence even if no task-linked memory was observed.`; }
+  const finish = HOST_CLOSES_TASK.has(provider)
+    ? ` ONLY if this task used Hunch (a hunch_* call on this ID, a task verify check, or an application to claim), call hunch_task(action: "finish", task_id, cwd) before responding and show its card; otherwise skip it — this host's stop hook closes the task and shows the evidence.`
+    : ` This host wires no stop hook, so finish the task yourself: call hunch_task(action: "finish", task_id, cwd) before responding and show its card.`;
+  return `${head}${verify}${finish}`;
 }
 /** The session key a hook event maps to: a hash of (root, provider, session,
  * agent), never the identifier itself. Null without a host session. */

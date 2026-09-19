@@ -689,7 +689,7 @@ export interface RootControlOptions {
  * per-host prose (CLAUDE.md, AGENTS.md) and hooks add to it, never replace it. */
 export const MCP_INSTRUCTIONS = [
   "Hunch is this repository's engineering memory: decisions, bug history, invariants, components, with provenance.",
-  "Per user task: (1) hunch_task(action:\"start\", title) once — unless the host's prompt hook already printed a task_id, then reuse it; (2) hunch_context(target, task_id) FIRST, before reading or editing, for the file, symbol, or task phrase; (3) hunch_check_constraints(scope) before editing shared code; (4) hunch_task(action:\"finish\", task_id) before the final response and show its contribution card.",
+  "Per user task: (1) hunch_task(action:\"start\", title) once — skip it when the host's prompt hook already opened the task and printed its verify command, and reuse that task_id; (2) hunch_context(target, task_id) FIRST, before reading or editing, for the file, symbol, or task phrase; (3) hunch_check_constraints(scope) before editing shared code; (4) hunch_task(action:\"finish\", task_id) before the final response, showing its contribution card — required when the task used Hunch, skippable where the host's own stop hook closes the task for you.",
   "Then by moment: hunch_why(target) for rationale and rejected alternatives, hunch_bug_lineage before fixing a failure, hunch_record_decision after a non-trivial choice, hunch_record_correction when a human corrects you.",
   "Hosts without lifecycle hooks (Windsurf, Cursor, or Codex before its hooks are trusted) receive no automatic grounding: call these tools yourself.",
 ].join("\n");

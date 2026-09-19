@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { finishReportTask, listReportTasks, listTaskSummaries, readTaskReport, recordTaskDelivery, reportHash, startReportTask } from "../src/core/taskReport.js";
-import { promptTaskId } from "../src/core/taskReportHook.js";
+import { promptTaskId, taskInstruction } from "../src/core/taskReportHook.js";
+import { verificationLauncher } from "../src/core/verifyLauncher.js";
 import { buildDeliveryEnvelope } from "../src/core/delivery.js";
 import type { AssembledContext } from "../src/store/hunchStore.js";
 import { HunchStore } from "../src/store/hunchStore.js";
@@ -344,4 +345,54 @@ test("prompt-derived titles are opt-in: the default retains no prompt text, the 
   const again = hook(root, "UserPromptSubmit", { prompt: "Fix the settings merge so nested overrides survive\nsecond line is never used" });
   assert.equal(listReportTasks(root).filter(x => x.task_id === task!.task_id).length, 1);
   assert.match(again.hookSpecificOutput.additionalContext, new RegExp(task!.task_id));
+});
+
+test("the prompt hook prints the verify command inline and never asks for a start call (dec_0bf3bda2c1)", t => {
+  const root = fixture(t);
+  const prompt = hook(root, "UserPromptSubmit");
+  const [task] = listReportTasks(root);
+  const text = prompt.hookSpecificOutput.additionalContext as string;
+  // The one thing hunch_task start used to supply is now in the instruction.
+  assert.ok(text.includes(` task verify ${task!.task_id} -- `), `no inline verify command in: ${text}`);
+  assert.ok(text.includes(verificationLauncher().argv.at(-1)!), "the inline command names this installation's CLI entry");
+  assert.doesNotMatch(text, /action: "start"/, "the hook must not ask for a start call");
+  assert.doesNotMatch(text, /verification_argv/);
+  // Finish is conditional, and the host close is what makes that safe.
+  assert.match(text, /ONLY if this task used Hunch/);
+  assert.match(text, /action: "finish"/);
+});
+
+test("the task instruction is identical in substance for every hook provider, and keeps finish mandatory where no host stop hook closes the task", () => {
+  const task = { task_id: "htask_0123456789abcdef01234567", title: "Assistant task" };
+  const cwd = JSON.stringify("/repo");
+  // claude and codex are the providers that reach this today (NATIVE_PROMPT_HOSTS);
+  // both wire Stop, so both get the conditional finish, with identical substance.
+  const claude = taskInstruction(task, cwd, "claude");
+  const codex = taskInstruction(task, cwd, "codex");
+  assert.equal(claude, codex, "no provider is left on different wording");
+  for (const text of [claude, codex]) {
+    assert.doesNotMatch(text, /Claude Code|Codex/, "host-neutral prose (con_e04226bd05)");
+    assert.match(text, /ONLY if this task used Hunch/);
+  }
+  // A provider whose config wires a prompt hook but NO stop event: nobody but the
+  // next prompt's settle would close the task, so finish stays mandatory there.
+  const windsurf = taskInstruction(task, cwd, "windsurf");
+  assert.doesNotMatch(windsurf, /ONLY if/, "without a host stop hook, finish is not optional");
+  assert.match(windsurf, /no stop hook, so finish the task yourself/);
+  assert.match(windsurf, new RegExp(` task verify ${task.task_id} -- `), "the inline verify command is provider-independent");
+  assert.doesNotMatch(windsurf, /action: "start"/);
+});
+
+test("the task instruction fails open: a launcher that throws falls back to the start-call wording and never throws (con_03a0b94b2e)", () => {
+  const task = { task_id: "htask_0123456789abcdef01234567", title: "Assistant task" };
+  const cwd = JSON.stringify("/repo");
+  const broken = () => { throw new Error("tsx is not installed"); };
+  let text = "";
+  assert.doesNotThrow(() => { text = taskInstruction(task, cwd, "claude", broken); });
+  assert.match(text, /action: "start"/, "the fallback asks for the start call, as before this change");
+  assert.match(text, /verification_argv/);
+  assert.doesNotMatch(text, / task verify /, "no half-built command when the launcher is unavailable");
+  assert.ok(text.includes(task.task_id));
+  // The fallback applies whatever the provider is.
+  assert.match(taskInstruction(task, cwd, "windsurf", broken), /action: "start"/);
 });
