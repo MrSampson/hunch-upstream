@@ -1640,9 +1640,9 @@ function createOwnedCommitLock(lock: string): boolean {
     // mkdir is the exclusive atomic operation here. Renaming a staged directory
     // is NOT exclusive on POSIX: it may replace an already-existing empty lock
     // directory, which would steal a fresh legacy/ownerless lock. There is a
-    // harmless ownerless window between these two mkdir calls; contenders treat
-    // it as held, waiting it out while the directory is freshly touched and
-    // reclaiming it only after the conservative legacy TTL expires.
+    // harmless ownerless window between these two mkdir calls: it reads as held,
+    // and is reclaimed only after the conservative legacy TTL expires. A capture
+    // waits it out (waitForCommitLockHandoff); other callers just report busy.
     mkdirSync(lock);
     created = true;
     // Empty directories are not Git worktree entries, so owner metadata cannot
@@ -1731,15 +1731,18 @@ function waitForCommitLockHandoff(
   // An owner-less FIRST snapshot is either a transient window (creation,
   // release, lost reclaim race) or a stranded/legacy lock. Only the former is
   // worth waiting for: a stranded lock must not block the capture for the whole
-  // handoff. This is the one place the directory's mtime is consulted.
+  // handoff. This is the one place the WAIT POLICY consults the directory's
+  // mtime; acquireCommitLock still stats it for the legacy reclaim TTL.
   if (first.state === "held-unknown" && !ownerlessLockLooksTransient(lock)) return false;
   const deadline = Date.now() + timeoutMs;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   let attempt: CommitLockAttempt = first;
-  // How long the lock has been CONTINUOUSLY owner-less, measured locally: a
-  // sighting of a live owner resets it, because a genuine release window lasts
+  // How long the lock has read as held-unknown CONTINUOUSLY, measured locally:
+  // a sighting of a live owner resets it, because a genuine release window lasts
   // milliseconds. Reading it from this clock keeps the wait independent of the
-  // filesystem's mtime granularity and of other writers' clocks.
+  // filesystem's mtime granularity and of other writers' clocks. Besides a truly
+  // owner-less directory this also covers a dead owner whose reclaim another
+  // process has claimed — equally not a handoff this contender can wait for.
   let ownerlessSince: number | null = first.state === "held-unknown" ? Date.now() : null;
   // "Held" while the directory is not even there means mkdir keeps failing for a
   // reason that is not contention — a missing, read-only or full store — and no

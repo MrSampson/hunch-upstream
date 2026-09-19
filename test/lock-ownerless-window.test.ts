@@ -72,6 +72,9 @@ test("a FRESH ownerless lock another process is about to release is waited out, 
       `fs.mkdirSync(${JSON.stringify(lock)}, { recursive: true });`,
       `fs.writeFileSync(${JSON.stringify(ready)}, "ready\\n");`,
       `waitForMarker(${JSON.stringify(go)});`,
+      // Restart the entry window from the moment the parent is about to flush,
+      // so a slow runner cannot age the directory past it before the first stat.
+      `fs.utimesSync(${JSON.stringify(lock)}, new Date(), new Date());`,
       "sleep(300);",
       `fs.rmSync(${JSON.stringify(lock)}, { recursive: true, force: true });`,
       "process.exit(0);",
@@ -155,6 +158,9 @@ test("a live owner appearing during the ownerless window resets the wait and the
       "fs.mkdirSync(lock, { recursive: true });",
       `fs.writeFileSync(${JSON.stringify(ready)}, "ready\\n");`,
       `waitForMarker(${JSON.stringify(go)});`,
+      // Restart the entry window from the moment the parent is about to flush,
+      // so a slow runner cannot age the directory past it before the first stat.
+      "fs.utimesSync(lock, new Date(), new Date());",
       "sleep(200);",
       "fs.mkdirSync(path.join(lock, `owner-${process.pid}`), { recursive: true });",
       "sleep(3000);",
@@ -182,7 +188,7 @@ test("a live owner appearing during the ownerless window resets the wait and the
   }
 });
 
-test("a missing memory directory no-ops immediately — an un-creatable lock is not a handoff", { timeout: 60_000 }, () => {
+test("a missing memory directory gives up quickly — an un-creatable lock is not a handoff", { timeout: 60_000 }, () => {
   const { root, cleanup } = tempRepo();
   try {
     const missing = join(root, "absent", ".hunch");
@@ -192,13 +198,13 @@ test("a missing memory directory no-ops immediately — an un-creatable lock is 
 
     assert.equal(result, null, "there is nothing to commit and nothing to wait for");
     assert.ok(elapsed < 1_000,
-      `mkdir failing for a reason other than contention must never enter the handoff wait (took ${elapsed} ms)`);
+      `mkdir failing for a reason other than contention is abandoned after a few polls, not waited out (took ${elapsed} ms)`);
   } finally {
     cleanup();
   }
 });
 
-test("a read-only memory directory no-ops immediately — an un-creatable lock is not a handoff", { timeout: 60_000 }, (t) => {
+test("a read-only memory directory gives up quickly — an un-creatable lock is not a handoff", { timeout: 60_000 }, (t) => {
   if (process.platform === "win32") return t.skip("POSIX directory permissions");
   if (typeof process.getuid === "function" && process.getuid() === 0) return t.skip("root ignores directory permissions");
   const { hunchDir, lock, cleanup } = tempRepo();
@@ -211,10 +217,50 @@ test("a read-only memory directory no-ops immediately — an un-creatable lock i
 
     assert.equal(result, null, "a store that cannot be locked is a no-op");
     assert.ok(elapsed < 1_000,
-      `and must not spin the full handoff on a permission failure (took ${elapsed} ms)`);
+      `and a permission failure is abandoned after a few polls, not spun for the full handoff (took ${elapsed} ms)`);
     assert.equal(existsSync(lock), false, "no lock directory was created");
   } finally {
     try { chmodSync(hunchDir, 0o755); } catch { /* restore for cleanup */ }
+    cleanup();
+  }
+});
+
+test("an owner that vanishes without releasing is given up on after the window, not waited out forever", { timeout: 60_000 }, async () => {
+  const { root, hunchDir, lock, cleanup } = tempRepo();
+  const ready = join(root, "holder-ready");
+  const go = join(root, "parent-about-to-flush");
+  let holder: ReturnType<typeof spawn> | null = null;
+  try {
+    // The first snapshot is held-LIVE (the holder owns the lock), then the owner
+    // directory disappears while the holder stays alive and the outer lock dir
+    // remains. A sticky "a live owner was seen once" flag would keep polling to
+    // the full handoff deadline; the continuously-ownerless timer must not.
+    holder = spawnLockHolder([
+      HOLDER_PRELUDE,
+      `const lock = ${JSON.stringify(lock)};`,
+      "const owner = path.join(lock, `owner-${process.pid}`);",
+      "fs.mkdirSync(owner, { recursive: true });",
+      `fs.writeFileSync(${JSON.stringify(ready)}, "ready\\n");`,
+      `waitForMarker(${JSON.stringify(go)});`,
+      "sleep(300);",
+      "fs.rmSync(owner, { recursive: true, force: true });",
+      "sleep(30_000);", // stay alive: the pid keeps reading as live if re-read
+      "process.exit(0);",
+    ].join("\n"));
+    await waitFor(() => existsSync(ready), 5_000);
+
+    writeDec(hunchDir, "dec_owner_vanished");
+    writeFileSync(go, "go\n");
+    const startedAt = Date.now();
+    const result = commitAndPushHunch(hunchDir, "hunch: owner vanished without releasing", { push: false });
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(result, null, "an abandoned lock is not a handoff in progress");
+    assert.ok(elapsed > 1_500, `the ownerless window was actually waited out (took ${elapsed} ms)`);
+    assert.ok(elapsed < 10_000,
+      `and a live-owner sighting does not make the wait sticky to the full handoff (took ${elapsed} ms)`);
+  } finally {
+    if (holder && holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
     cleanup();
   }
 });
