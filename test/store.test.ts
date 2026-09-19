@@ -72,6 +72,66 @@ test("a 0-byte per-record file (merge-driver tombstone) loads as absent — no c
   }
 });
 
+/** A decision fixture written straight to disk under an arbitrary file name. */
+function writeDecisionFile(root: string, name: string, id: string, title: string): void {
+  writeFileSync(join(root, ".hunch", "decisions", name), JSON.stringify({
+    id, title, status: "accepted", context: "", decision: "x", consequences: [], alternatives_rejected: [],
+    related_components: [], related_files: [], supersedes: null, caused_by_bug: null, commit: null,
+    provenance: prov(0.9), date: "2026-06-01T00:00:00Z",
+  }));
+}
+
+test("a stray copy of a record file loads once, from its canonical <id>.json (issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_stray.json", "dec_stray", "canonical");
+  writeDecisionFile(root, "dec_stray_BASE_1234.json", "dec_stray", "aborted mergetool copy");
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (msg: string) => { warns.push(String(msg)); };
+  try {
+    const hits = store.json.loadAll("decisions").filter((d) => d.id === "dec_stray");
+    assert.equal(hits.length, 1, "the stray copy contributes no second record");
+    assert.equal(hits[0]?.title, "canonical", "the canonical file wins");
+    assert.ok(warns.some((w) => w.includes("stray copy") && w.includes("dec_stray_BASE_1234.json")));
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
+test("reindex survives a stray copy instead of failing on a duplicate primary key (issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_stray.json", "dec_stray", "canonical");
+  writeDecisionFile(root, "dec_stray (1).json", "dec_stray", "cloud-sync conflict copy");
+  const orig = console.warn;
+  console.warn = () => {};
+  try {
+    const { counts } = store.reindex();
+    assert.equal(counts.decisions, 2, "dec_1 + dec_stray, counted once each");
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
+test("a misnamed record with NO canonical file is kept, exactly once (con_947c578b2c, issue #291)", () => {
+  const { store, root, cleanup } = seed();
+  writeDecisionFile(root, "dec_orphan.orig.json", "dec_orphan", "only home");
+  writeDecisionFile(root, "dec_orphan_BASE_9.json", "dec_orphan", "second misnamed copy");
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (msg: string) => { warns.push(String(msg)); };
+  try {
+    const hits = store.json.loadAll("decisions").filter((d) => d.id === "dec_orphan");
+    assert.equal(hits.length, 1, "never two records with the same id");
+    assert.equal(hits[0]?.title, "only home", "deterministic: the first sorted name wins");
+    assert.ok(warns.some((w) => w.includes("expected file name dec_orphan.json")));
+  } finally {
+    console.warn = orig;
+    cleanup();
+  }
+});
+
 test("why() matches on path segments, never a bare suffix — 'io.ts' must not pull 'scenario.ts' records (issue #32)", () => {
   const { store, cleanup } = seed();
   store.json.put("symbols", { id: "sym_scen", file: "src/x/scenario.ts", name: "scen", kind: "function", signature_hash: "", calls: [], called_by: [], metrics: { loc: 5, churn_90d: 0, bug_count: 0, fan_in: 0, fan_out: 0 }, last_changed: "" } as never);

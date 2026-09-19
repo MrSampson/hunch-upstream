@@ -450,7 +450,17 @@ export class JsonStore {
       }
       return out;
     }
-    for (const name of this.jsonFileNames(kind)) {
+    // The canonical home of a record is `<id>.json` (see fileFor). A leftover
+    // COPY — `dec_x_BASE_1234.json` from an aborted mergetool, `dec_x.orig.json`,
+    // a cloud-sync `dec_x (1).json` — would otherwise yield a second record with
+    // the same id and blow up the SQLite rebuild on a duplicate primary key
+    // (issue #291). A misnamed file whose canonical name is ABSENT is the
+    // record's only home, so it is kept (con_947c578b2c: never silently drop).
+    // Names are sorted, so which stray wins in that case is deterministic.
+    const names = this.jsonFileNames(kind);
+    const present = new Set(names);
+    const seenMisnamed = new Set<string>();
+    for (const name of names) {
       let raw: unknown;
       try {
         const text = this.readContainedFile(directory, join(directory.lexical, name), this.maxBytes(kind));
@@ -468,8 +478,20 @@ export class JsonStore {
         continue;
       }
       const r = schema.safeParse(this.migrate(kind, raw, version));
-      if (r.success) out.push(r.data as EntityFor[K]);
-      else console.warn(`[hunch] skipping invalid ${kind}/${name}: ${r.error.issues[0]?.message}`);
+      if (!r.success) {
+        console.warn(`[hunch] skipping invalid ${kind}/${name}: ${r.error.issues[0]?.message}`);
+        continue;
+      }
+      const id = (r.data as { id?: unknown }).id;
+      if (typeof id === "string" && `${id}.json` !== name) {
+        if (present.has(`${id}.json`) || seenMisnamed.has(id)) {
+          console.warn(`[hunch] skipping stray copy ${kind}/${name}: its record id ${id} belongs in ${id}.json`);
+          continue;
+        }
+        console.warn(`[hunch] ${kind}/${name} holds record ${id}; expected file name ${id}.json`);
+        seenMisnamed.add(id);
+      }
+      out.push(r.data as EntityFor[K]);
     }
     return out;
   }
