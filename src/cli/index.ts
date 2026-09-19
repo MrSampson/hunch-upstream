@@ -36,7 +36,7 @@ import { publishedStatus, type PublishedStatus } from "../integrations/registry.
 import { HunchStore } from "../store/hunchStore.js";
 import { JsonStore } from "../store/jsonStore.js";
 import { selectEmbedder } from "../store/embedder.js";
-import { assertCompleteRepoScan, indexRepo, scanRepo } from "../extractors/indexer.js";
+import { assertCompleteRepoScan, indexRepo, mergeScannedEdges, scanRepo } from "../extractors/indexer.js";
 import { syncCommit, recordFailure, captureTestRun } from "../synthesis/synthesize.js";
 import { parseTestReport } from "../extractors/testreport.js";
 import {
@@ -393,7 +393,7 @@ program
         // any mutator. With no commit identity there is no safe public source,
         // so leave no source-derived records behind for a future pump.
         store.json.replaceAll("symbols", []);
-        store.json.replaceAll("edges", []);
+        store.json.replaceAll("edges", mergeScannedEdges(store.json.loadAll("edges"), []));
         store.json.replaceAll("components", []);
         store.reindex();
         console.log("  ⚠ skipped code graph: no committed HEAD — commit code, then run `hunch index`");

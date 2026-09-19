@@ -618,6 +618,24 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
   };
 }
 
+/** True for an edge this indexer produced: the scan re-derives exactly these on
+ *  every pass, so they — and only they — are safe to replace wholesale. */
+export function isExtractorEdge(edge: Edge): boolean {
+  return edge.schema === "hunch.edge/1" && edge.provenance.source === "extracted";
+}
+
+/** Merge a fresh scan into the stored edge set. A scan can only re-derive what
+ *  it extracted; `supersedes` edges (written by the store) and human-reviewed
+ *  Landscape relationships have no other source, so replacing the whole index
+ *  with the scan deleted them on every `hunch index` (issue #288). Non-extractor
+ *  edges are carried forward in their stored order and win an id collision:
+ *  a reviewed or store-written fact outranks a re-derivable one. */
+export function mergeScannedEdges(stored: Edge[], scanned: Edge[]): Edge[] {
+  const carried = stored.filter((edge) => !isExtractorEdge(edge));
+  const carriedIds = new Set(carried.map((edge) => edge.id));
+  return [...carried, ...scanned.filter((edge) => !carriedIds.has(edge.id))];
+}
+
 /** Persist one pure scan into the Git-native source of truth. */
 export function indexRepo(store: HunchStore, root: string, opts: IndexRepoOptions = {}): IndexResult {
   if (opts.requireClean) {
@@ -633,7 +651,7 @@ export function indexRepo(store: HunchStore, root: string, opts: IndexRepoOption
   const scan = scanRepo(store, root, { churn: opts.churn, source });
   if (opts.requireComplete) assertCompleteRepoScan(scan);
   store.json.replaceAll("symbols", scan.symbols);
-  store.json.replaceAll("edges", scan.edges);
+  store.json.replaceAll("edges", mergeScannedEdges(store.json.loadAll("edges"), scan.edges));
   store.json.replaceAll("components", scan.components);
   return scan.result;
 }
