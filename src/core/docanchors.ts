@@ -31,22 +31,68 @@ const MARKER = /<!--\s*hunch:topic\s+([A-Za-z0-9._/-]+)(?:\s+(dec_[A-Za-z0-9]+))
  *  CommonMark-lite: a fence of N chars (≤3 leading spaces) closes only on a
  *  line of ≥N of the same char and nothing else; an unclosed fence runs to
  *  EOF; a backtick fence's info string may not itself contain a backtick.
- *  Expects LF-normalized text — see parseDocAnchors's normalization; a
+ *  The "≤3 leading spaces" is measured relative to the enclosing LIST ITEM's
+ *  content offset, so a fence indented under `1. step` (issue #331) is still a
+ *  fence and not an indented code block. Deliberate limits: no lazy
+ *  continuations (a non-blank line indented less than an open item's content
+ *  offset ends the item, and with it the fence) and no blockquote containers —
+ *  a `>` prefix is still read as ordinary text. With no list open the item
+ *  stack is empty, the base is 0 and behaviour is the plain CommonMark-lite
+ *  one. Expects LF-normalized text — see parseDocAnchors's normalization; a
  *  caller that skips it re-opens the CRLF fence-detection bug. */
 function fencedRanges(text: string): Array<[number, number]> {
+  const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
   const ranges: Array<[number, number]> = [];
-  let open: { ch: string; len: number; start: number } | null = null;
+  let open: { ch: string; len: number; start: number; base: number } | null = null;
+  // Content offsets (columns) of the currently open list items, outermost first.
+  const items: number[] = [];
   let offset = 0;
   for (const line of text.split("\n")) {
-    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (m) {
-      const ch = m[1]![0]!;
-      if (!open) {
-        if (!(ch === "`" && m[2]!.includes("`"))) open = { ch, len: m[1]!.length, start: offset };
-      } else if (ch === open.ch && m[1]!.length >= open.len && m[2]!.trim() === "") {
-        ranges.push([open.start, offset + line.length]);
+    // Matching-only copy: tabs in the indent count as 4 columns. Offsets below
+    // always come from the ORIGINAL line, never from the probe.
+    const probe = line.replace(/^[ \t]+/, (ws) => ws.replace(/\t/g, "    "));
+    const indent = probe.length - probe.replace(/^ +/, "").length;
+    const blank = probe.trim() === "";
+
+    if (open) {
+      if (!blank && indent < open.base) {
+        // The list item holding the fence ended, which ends the fence too.
+        ranges.push([open.start, offset - 1]);
         open = null;
+      } else {
+        const m = FENCE.exec(probe.slice(Math.min(open.base, indent)));
+        if (m && m[1]![0]! === open.ch && m[1]!.length >= open.len && m[2]!.trim() === "") {
+          ranges.push([open.start, offset + line.length]);
+          open = null;
+        }
+        offset += line.length + 1;
+        continue; // the item stack is frozen while a fence is open
       }
+    }
+
+    if (blank) {
+      offset += line.length + 1;
+      continue; // a blank line neither opens nor closes an item here
+    }
+    while (items.length && items.at(-1)! > indent) items.pop();
+    for (;;) {
+      const base = items.at(-1) ?? 0;
+      const rest = probe.slice(base);
+      if (/^ {0,3}([-*_])( *\1){2,} *$/.test(rest)) break; // thematic break, not a list marker
+      const li = /^( {0,3})([-*+]|\d{1,9}[.)])( +|$)/.exec(rest);
+      if (li) {
+        // ≥5 spaces after the marker starts an indented code block, so the
+        // item's content begins one column after the marker instead.
+        const w = li[3]!.length >= 1 && li[3]!.length <= 4 ? li[3]!.length : 1;
+        items.push(base + li[1]!.length + li[2]!.length + w);
+        continue; // `- 1. x` nests, and "- ```js" opens a fence on the marker line
+      }
+      const m = FENCE.exec(rest);
+      if (m) {
+        const ch = m[1]![0]!;
+        if (!(ch === "`" && m[2]!.includes("`"))) open = { ch, len: m[1]!.length, start: offset, base };
+      }
+      break;
     }
     offset += line.length + 1;
   }

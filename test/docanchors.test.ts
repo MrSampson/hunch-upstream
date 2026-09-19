@@ -102,6 +102,111 @@ test("parseDocAnchors: a lone-CR document — stray backticks on different lines
   assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 2 }]);
 });
 
+const LIST_DOC = [
+  "# How to anchor a doc",
+  "",
+  "1. Anchor a doc like this:",
+  "",
+  "    ```markdown",
+  "    <!-- hunch:topic example.topic dec_ffff000009 -->",  // example inside a list-item fence → inert
+  "    ```",
+  "",
+  "<!-- hunch:topic real.topic dec_aaaa000001 -->",         // back at column 0 → live
+  "Prose about the real topic.",
+];
+
+test("parseDocAnchors: a fence indented inside a list item still hides its example marker (issue #331)", () => {
+  assert.deepEqual(parseDocAnchors(LIST_DOC.join("\n")), [
+    { topic: "real.topic", pin: "dec_aaaa000001", line: 9 },
+  ]);
+});
+
+test("parseDocAnchors: a list-item fence on a CRLF checkout behaves the same (issue #331)", () => {
+  assert.deepEqual(parseDocAnchors(LIST_DOC.join("\r\n")), [
+    { topic: "real.topic", pin: "dec_aaaa000001", line: 9 },
+  ]);
+});
+
+test("parseDocAnchors: bullet items and nested items hide their fenced examples (issue #331)", () => {
+  const md = [
+    "- item",
+    "",
+    "  ```md",
+    "  <!-- hunch:topic bullet.example dec_ffff000009 -->",
+    "  ```",
+    "",
+    "- a",
+    "  - b",
+    "",
+    "    ```md",
+    "    <!-- hunch:topic nested.example -->",
+    "    ```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 14 }]);
+});
+
+test("parseDocAnchors: a fence opened on the list-marker line itself hides its example (issue #331)", () => {
+  const md = [
+    "- ```md",
+    "  <!-- hunch:topic marker.line.example dec_ffff000009 -->",
+    "  ```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 5 }]);
+});
+
+test("parseDocAnchors: an unclosed list-item fence ends with the item, not at EOF (issue #331)", () => {
+  const md = [
+    "1. step:",
+    "",
+    "    ```md",
+    "    <!-- hunch:topic example.topic dec_ffff000009 -->",  // inside the unclosed fence → inert
+    "",
+    "Back to ordinary prose.",                                // column 0 → the item (and the fence) ends
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",         // must stay live
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 8 }]);
+});
+
+test("parseDocAnchors: with no list open, an indented ``` line is still an indented code block (issue #331)", () => {
+  const md = [
+    "Prose.",
+    "",
+    "    ```",
+    "    <!-- hunch:topic indented.topic dec_ffff000009 -->",  // indented code block, not a fence → live
+    "    ```",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "indented.topic", pin: "dec_ffff000009", line: 4 }]);
+});
+
+test("parseDocAnchors: a thematic break does not open a list item (issue #331)", () => {
+  for (const rule of ["- - -", "* * *"]) {
+    const md = [
+      rule,
+      "",
+      "    ```",
+      "    <!-- hunch:topic break.topic dec_ffff000009 -->",  // no item is open → indented code block → live
+      "    ```",
+    ].join("\n");
+    assert.deepEqual(parseDocAnchors(md), [{ topic: "break.topic", pin: "dec_ffff000009", line: 4 }], rule);
+  }
+});
+
+test("parseDocAnchors: an indented code block INSIDE a list item is not a fence (issue #331)", () => {
+  const md = [
+    "1. step:",           // content offset 3
+    "",
+    "       ```",         // 7 spaces = 4 past the item content → indented code block
+    "       <!-- hunch:topic deep.topic dec_ffff000009 -->",
+    "       ```",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "deep.topic", pin: "dec_ffff000009", line: 4 }]);
+});
+
 test("parseDocAnchors: markers inside inline code spans are examples too", () => {
   const md = [
     "Anchor a section with `<!-- hunch:topic span.example -->` in the doc.",   // inline span → ignored
