@@ -1513,6 +1513,10 @@ workspacesCmd
           return console.log("  · or set .hunch/config.json {\"workspaces\":{\"publish_public\":true}} to commit it into this repo's .hunch/");
         case "unchanged":
           return console.log(`✓ unchanged since ${out.previous.observed_at} (${out.record.id}) — nothing written`);
+        case "deferred":
+          return console.log(out.reason === "detached-head"
+            ? "deferred: HEAD is detached — the next checkout or ledger read records this machine"
+            : "deferred: a git operation is in progress — the next checkout or ledger read records this machine");
         case "collision":
           return fail(`not written: ${out.reason}\n  · \`hunch workspaces forget ${out.record.id}\` removes the stale copy (a normal, revertable memory move), then snapshot again`);
         case "written":
@@ -1561,7 +1565,7 @@ workspacesCmd
       for (const r of results) console.log(`  ${r.outcome === "deleted" ? "✓" : r.outcome === "skipped" ? "–" : "✗"} ${r.step.branch}: ${r.detail}`);
       const failed = results.filter((r) => r.outcome === "failed").length;
       const skipped = results.filter((r) => r.outcome === "skipped").length;
-      const ledger = recorded === "written" ? " · ledger updated" : recorded === "unchanged" || recorded === "no-home" || recorded === "off" ? "" : ` · ledger not updated (${recorded})`;
+      const ledger = recorded === "written" ? " · ledger updated" : recorded === "unchanged" || recorded === "no-home" || recorded === "off" ? "" : recorded === "deferred" ? " · ledger deferred (git operation in progress or detached HEAD)" : ` · ledger not updated (${recorded})`;
       console.log(`\n${results.length - failed - skipped} deleted, ${skipped ? `${skipped} skipped (nothing changed), ` : ""}${failed} refused by git${ledger}`);
       if (failed || skipped) process.exitCode = 1;
     } finally {
