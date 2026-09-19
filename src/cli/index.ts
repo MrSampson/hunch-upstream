@@ -97,7 +97,7 @@ import { appendEvent, readEvents } from "../core/events.js";
 import { computeStats, formatStats } from "../core/stats.js";
 import { injectionMode, resetSessionInjections } from "../core/hookcache.js";
 import { recordServed, servedSummary } from "../core/served.js";
-import { recordTaskDelivery, reportActivity, reportPresentationEnabled, unseenLessons } from "../core/taskReport.js";
+import { recordTaskDelivery, reportActivity, reportHash, reportPresentationEnabled, unseenLessons } from "../core/taskReport.js";
 import { snapshotDeliveredRecords } from "../core/taskReportEvidence.js";
 import { renderRecalledLine } from "../core/taskReportRender.js";
 import { closeHookTask, hookReportTaskId, nativeHookCwd, settleHookSession, startHookReport, stopHookReport, observeHookDenial } from "../core/taskReportHook.js";
@@ -4936,7 +4936,11 @@ program
       const reportTaskId = hookReportTaskId(root, provider, evt);
       // A new authoritative prompt gets its own full delivery. An earlier
       // prompt's session-level delta cannot establish this task's receipt.
-      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}`, text) === "delta") {
+      // A subagent reports to the prompt's task but starts with FRESH context:
+      // it never saw that grounding, so its dedup is scoped by its own agent
+      // identity (hashed — the raw agent_id is never retained in the key).
+      const agentKey = evt.agent_id ? `:${reportHash(evt.agent_id).slice(7, 19)}` : "";
+      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}${agentKey}`, text) === "delta") {
         receipts("refreshed");
         emitContext(
           provider,
