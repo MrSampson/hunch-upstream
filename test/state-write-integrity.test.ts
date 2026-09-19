@@ -5,10 +5,15 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { tempStore } from "./helpers.js";
 import { hunchPaths } from "../src/core/paths.js";
-import type { HunchStore } from "../src/store/hunchStore.js";
-import { StateRefusal, partitionOf, readState, subscribeState, writeState } from "../src/store/stateBinding.js";
+import { HunchStore } from "../src/store/hunchStore.js";
+import { StateRefusal, partitionOf, readState, stateHomeFor, subscribeState, writeState } from "../src/store/stateBinding.js";
+import { WriteLockTimeout, withWriteLock, writeLockPath } from "../src/serve/writelock.js";
+import { compactPartition } from "../src/cli/serve.js";
 import { compactLedger, emptyLedger, readLedger, writeLedger } from "../src/store/changeLedger.js";
 import { formatReplayReport, verifyReplay } from "../src/store/replay.js";
 import { actionReceiptId, commitmentId, entityId, stateHash } from "../src/core/stateContract.js";
@@ -145,4 +150,62 @@ test("#284: an identical retry replays even after an entity claimed the subject;
     assert.throws(() => write(store, "commitments", { ...rec, status: "waiting" }, "outbox-commit-0001"), (e: unknown) => e instanceof StateRefusal && (e.code === "idempotency" || e.code === "identity"));
     assert.equal(verifyReplay(store, scope).ok, true);
   } finally { cleanup(); }
+});
+
+test("#286: `serve compact` takes the partition write lock — a live writer's ledger is never clipped under it", async () => {
+  const { store, root, cleanup } = tempStore();
+  try {
+    const scope = partitionOf(store);
+    const hunchDir = hunchPaths(store.publicRoot).hunch;
+    for (let i = 0; i < 3; i++) write(store, "commitments", commitment(store, `site:lock-${i}`), `lock-commit-000${i}`);
+    assert.equal(readLedger(hunchDir, scope).events.length, 3);
+
+    // A concurrent writer holds the lock; compaction must not rewrite the ledger under it.
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let clippedWhileHeld: number | null = null;
+    const holder = withWriteLock(hunchDir, async () => {
+      await assert.rejects(
+        compactPartition(root, scope, 0, { timeoutMs: 50 }),
+        (e: unknown) => e instanceof WriteLockTimeout,
+        "compaction must wait for the lock, not clip the ledger under a live writer",
+      );
+      clippedWhileHeld = readLedger(hunchDir, scope).events.length;
+      await held;
+    });
+    release();
+    await holder;
+    assert.equal(clippedWhileHeld, 3, "the ledger was untouched while another writer held the lock");
+
+    // Once the lock is free the same call succeeds and the lock is released again.
+    const result = await compactPartition(root, scope, 0);
+    assert.equal(result.dropped, 3);
+    assert.equal(readLedger(hunchDir, scope).events.length, 0);
+    assert.ok(!existsSync(writeLockPath(hunchDir)), "compaction releases the lock");
+  } finally { cleanup(); }
+});
+
+test("#286: `serve compact` compacts the store's RESOLVED state home — the overlay in shared mode, not <root>/.hunch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-compact-shared-"));
+  const overlay = join(mkdtempSync(join(tmpdir(), "hunch-compact-overlay-")), ".hunch");
+  try {
+    mkdirSync(join(root, ".hunch"), { recursive: true });
+    mkdirSync(overlay, { recursive: true });
+    writeFileSync(join(root, ".hunch", "local.json"), JSON.stringify({ privateDir: overlay, mode: "shared", autoCommit: false }) + "\n");
+    const store = new HunchStore(hunchPaths(root));
+    let scope;
+    try {
+      scope = partitionOf(store);
+      assert.equal(stateHomeFor(store, scope).hunchDir, overlay, "shared mode homes this partition in the overlay");
+      for (let i = 0; i < 2; i++) write(store, "commitments", commitment(store, `site:shared-${i}`), `shared-commit-000${i}`);
+      assert.equal(readLedger(overlay, scope).events.length, 2, "the writes landed in the overlay ledger");
+    } finally { store.close(); }
+
+    const result = await compactPartition(root, scope, 0);
+    assert.equal(result.dropped, 2, "compaction found the overlay ledger, not an empty <root>/.hunch one");
+    assert.equal(readLedger(overlay, scope).events.length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(join(overlay, ".."), { recursive: true, force: true });
+  }
 });
