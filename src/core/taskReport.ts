@@ -144,7 +144,10 @@ export interface LessonHistory {
 }
 
 type Database = Parameters<Parameters<typeof withServedDatabase>[1]>[0];
-function taskDb<T>(root: string, run: (db: Database) => T): T {
+/** Explicit report operations wait out a competing writer; hook/delivery paths keep
+ * the ledger's 100 ms default so a receipt never costs a delivery. */
+const PATIENT_BUSY_MS = 5_000;
+function taskDb<T>(root: string, run: (db: Database) => T, patient = false): T {
   return withServedDatabase(root, (db) => {
     db.exec(`CREATE TABLE IF NOT EXISTS report_tasks (
       task_id TEXT PRIMARY KEY, scope TEXT NOT NULL, body TEXT NOT NULL
@@ -160,10 +163,12 @@ function taskDb<T>(root: string, run: (db: Database) => T): T {
     );
     CREATE INDEX IF NOT EXISTS report_record_lookup ON report_record_links(kind, record_id, content_hash);
     CREATE TABLE IF NOT EXISTS report_history_progress (id INTEGER PRIMARY KEY CHECK(id = 1), through_rowid INTEGER NOT NULL);
-    INSERT OR IGNORE INTO report_history_progress VALUES (1, 0);
     CREATE TABLE IF NOT EXISTS report_task_aliases (alias_id TEXT PRIMARY KEY, task_id TEXT NOT NULL);`);
+    // Seed only when the row is missing: an unconditional INSERT made every pure
+    // read take the writer lock. INSERT OR IGNORE still settles the race.
+    if (!db.prepare("SELECT 1 FROM report_history_progress WHERE id = 1").get()) db.exec("INSERT OR IGNORE INTO report_history_progress VALUES (1, 0)");
     return run(db);
-  });
+  }, patient ? { busyTimeoutMs: PATIENT_BUSY_MS } : {});
 }
 
 /** A prompt identity that reports to another prompt's task: a host notification
@@ -373,6 +378,9 @@ function appendEvent(root: string, taskId: string, kind: string, body: unknown, 
   const id = eventId ?? `hev_${randomBytes(12).toString("hex")}`;
   if (!/^(hev|hocc)_[a-f0-9]{24}$/.test(id)) throw new Error("invalid report event identity");
   const contentHash = reportHash(body);
+  // Explicit CLI/agent operations; passive observers (delivery, save, refusal,
+  // conformance) keep the default so an observation never costs a delivery.
+  const patient = kind === "check-start" || kind === "check" || kind === "claim";
   return taskDb(root, db => transaction(db, () => {
     const task = readTask(db, root, taskId);
     const prior = db.prepare("SELECT task_id, kind, content_hash FROM report_events WHERE event_id = ?").get(id) as { task_id: string; kind: string; content_hash: string } | undefined;
@@ -421,7 +429,7 @@ function appendEvent(root: string, taskId: string, kind: string, body: unknown, 
     const seq = Number(inserted.lastInsertRowid);
     db.prepare("UPDATE report_history_progress SET through_rowid = ? WHERE id = 1 AND through_rowid = ?").run(seq, seq - 1);
     return id;
-  }));
+  }), patient);
 }
 
 /** The record revisions among `records` that this task has not received before.
@@ -482,11 +490,25 @@ export function recordReportConformance(root: string, taskId: string, conformanc
   if (!report.deliveries.some(d => d.records.some(r => r.kind === value.kind && r.record_id === value.record_id && r.content_hash === value.content_hash))) throw new Error("rule evaluation does not name a record revision delivered in this task");
   return appendEvent(root, taskId, "conformance", value);
 }
+/** SQLITE_BUSY (5) / SQLITE_LOCKED (6); node:sqlite carries the extended code. */
+function isBusyError(error: unknown): boolean {
+  const code = (error as { errcode?: number }).errcode;
+  if (typeof code === "number") return (code & 0xff) === 5 || (code & 0xff) === 6;
+  return /database is locked/i.test((error as Error)?.message ?? "");
+}
 /** Only the local runner calls this. MCP never accepts a claimed successful check. */
 export function recordReportCheck(root: string, taskId: string, check: ReportCheck): string {
   const value = ReportCheckSchema.parse(check);
   if (!value.check_id) throw new Error("verification result requires a reserved check identity");
-  return appendEvent(root, taskId, "check", value, `hev_${reportHash({ taskId, check: value.check_id }).slice(7, 31)}`);
+  const id = `hev_${reportHash({ taskId, check: value.check_id }).slice(7, 31)}`;
+  // A result that took minutes to produce must not be lost to a busy ledger. The
+  // write is idempotent (deterministic id; appendEvent returns the existing id for
+  // identical content), so a retry is safe. Each attempt already waits out
+  // PATIENT_BUSY_MS in BEGIN IMMEDIATE; no sleep between them.
+  for (let attempt = 1; ; attempt++) {
+    try { return appendEvent(root, taskId, "check", value, id); }
+    catch (error) { if (attempt >= 3 || !isBusyError(error)) throw error; }
+  }
 }
 /** A start without a result blocks completion only while the runner could still
  * deliver one: its own timeout plus a minute of grace. After that the runner is
@@ -523,7 +545,7 @@ export function finishReportTask(root: string, taskId: string, state: "completed
     const finished = TaskSchema.parse({ ...task, state, finished_at: new Date().toISOString(), closed_by: by });
     db.prepare("UPDATE report_tasks SET body = ? WHERE task_id = ?").run(JSON.stringify(finished), taskId);
     return finished;
-  }));
+  }), by === "agent");
 }
 /** A report with no observation of any kind. Presentation surfaces may stay
  * silent for it; the task row itself is retained so "never touched Hunch" is
