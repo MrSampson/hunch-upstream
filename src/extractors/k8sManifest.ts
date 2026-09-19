@@ -130,6 +130,20 @@ const BARE_TEMPLATE_LINE = /^\s*(?:-\s+)?\{\{[\s\S]*$/;
 // -- reparenting the item's real children one level up (`containers.name`
 // instead of `containers[0].name`), silently dropping every reference under it.
 const BARE_LIST_MARKER = /^(\s*)-[ \t]*\r?$/;
+// A list item whose ENTIRE content is a block-scalar header (`- |`, `- |-`,
+// `- >`, `- |2`, `- | # comment`) -- the idiomatic way a chart inlines a shell
+// script into `args:`/`command:`. The item's value is opaque TEXT, not YAML,
+// yet the body lines look exactly like manifest fields (a heredoc'd
+// `secretKeyRef:` block is the canonical case), and this line matches neither
+// KEY_LINE (no colon) nor BARE_LIST_MARKER (something follows the dash), so it
+// fell to the unrecognized-line branch and the script body was then scanned as
+// the surrounding container's children -- inventing a reference to a resource
+// that only ever existed as text. The `key: |` form needs no such handling:
+// its body nests under the key's OWN frame, where no reference field-path can
+// match. The rest is captured (not `[|>]` inline) so the header can be run
+// through stripTrailingComment before BLOCK_SCALAR_HEADER, exactly as a
+// key line's value is.
+const BLOCK_SCALAR_LIST_ITEM = /^(\s*)-[ \t]+(.*?)\r?$/;
 // A YAML block-scalar header (`|`, `>`, plus an optional chomping indicator
 // `+`/`-` and/or an explicit indent digit, in either order: `|`, `|-`, `>+`,
 // `|2`, `|2-`, `|-2`). When a key's value is JUST this header, the real
@@ -180,7 +194,7 @@ function stripQuotes(value: string): string {
  *  below its own indent; a sequence frame is only ever closed by a
  *  shallower-indent line, never by an equal-indent one (equal-indent means
  *  "next item"). */
-function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEntry[]; unresolvedContainers: Set<string> } {
+function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEntry[]; unresolvedContainers: Set<string>; valuelessKeyParents: Set<string> } {
   const entries: FieldPathEntry[] = [];
   // A container (mapping) this scanner could not fully account for -- either
   // an explicit {{ }} template injection, OR a line shape KEY_LINE doesn't
@@ -191,8 +205,21 @@ function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEnt
   // avoid. Silently ignoring what the scanner can't parse is not safe here;
   // "I can't tell" must read as "unresolved," the same as a real template.
   const unresolvedContainers = new Set<string>();
+  // The framePath of every container that DIRECTLY holds a key written with no
+  // value at all (`tier:`). Deliberately its own set rather than more entries
+  // in unresolvedContainers: an ordinary container like `spec:` legitimately
+  // holds value-less keys (every nested mapping starts with one), so folding
+  // these in would destroy that set's meaning -- "the scanner could not
+  // account for this line". Only a map that is supposed to be FLAT
+  // (selector/labels) cares, and it checks this set itself.
+  const valuelessKeyParents = new Set<string>();
   const stack: StackFrame[] = [];
   let charOffset = baseChar;
+  // Indent of the `-` of a `- |` list item whose block-scalar body is being
+  // skipped, or null when no such skip is active. The body ends at the first
+  // line indented at or shallower than that dash (YAML's own rule for where a
+  // sequence item's content stops).
+  let blockScalarSkipIndent: number | null = null;
 
   const popToForListItem = (dashIndent: number): void => {
     while (stack.length) {
@@ -259,6 +286,30 @@ function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEnt
     const lineStartChar = charOffset;
     charOffset += line.length + 1; // +1 for the \n split() consumed
 
+    // Inside a `- |` item's body: these lines are script/config TEXT, so they
+    // must never be read as field structure. Runs after the charOffset
+    // bookkeeping above so skipped lines still advance the offset exactly --
+    // every atChar/endChar after the block scalar depends on it.
+    if (blockScalarSkipIndent !== null) {
+      // A blank line is part of the block scalar (YAML lets a scalar body
+      // contain empty lines at any indent), never its terminator.
+      if (line.trim().length === 0) continue;
+      if (BARE_TEMPLATE_LINE.test(line)) {
+        // A `{{ }}` action line's own indentation carries no structural
+        // meaning (`{{-` chomps it; the `| indent N` idiom puts the action at
+        // column 0 -- see markAllOpenContainersUnresolved), so a column-0
+        // action inside a script body must NOT be read as a dedent that ends
+        // the skip and re-exposes the remaining body lines as fields. Taint
+        // conservatively and stay in the skip: we cannot tell whether the
+        // action sits inside the scalar or after it.
+        markAllOpenContainersUnresolved();
+        continue;
+      }
+      const indent = line.length - line.trimStart().length;
+      if (indent > blockScalarSkipIndent) continue; // still the scalar's body
+      blockScalarSkipIndent = null; // dedented out of the item -- real YAML again
+    }
+
     if (BARE_TEMPLATE_LINE.test(line)) {
       markAllOpenContainersUnresolved();
       continue;
@@ -268,6 +319,19 @@ function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEnt
     if (bareListMarker) {
       const dashIndent = bareListMarker[1]!.length;
       enterListItem(dashIndent, dashIndent + 1);
+      continue;
+    }
+
+    // Checked BEFORE the KEY_LINE match: KEY_LINE can't match this shape
+    // anyway (no colon), but without this branch it would land in the
+    // unrecognized-line branch below and the body would be scanned as fields.
+    const blockScalarItem = BLOCK_SCALAR_LIST_ITEM.exec(line);
+    if (blockScalarItem && BLOCK_SCALAR_HEADER.test(stripTrailingComment(blockScalarItem[2]!).trim())) {
+      const dashIndent = blockScalarItem[1]!.length;
+      // It IS a real sequence item, so enter it exactly as the bare-marker
+      // form does -- sibling items after this one must keep their indices.
+      enterListItem(dashIndent, dashIndent + 1);
+      blockScalarSkipIndent = dashIndent;
       continue;
     }
 
@@ -322,6 +386,17 @@ function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEnt
     // the flow-collection check above, so a genuine quoted `name: "|"` stays
     // a literal and isn't mistaken for an unterminated block scalar.
     if (BLOCK_SCALAR_HEADER.test(value)) { unresolvedContainers.add(parentPath); continue; }
+    // A key written with NO value (`tier:`) creates a frame but never an
+    // entry, so it is invisible to extractLiteralLabelMap -- which then
+    // returns the map MINUS that key. For a flat string->string map
+    // (selector/labels) a value-less direct child is either a null value or a
+    // nested container; either way the key is silently absent, and a selector
+    // short one key matches strictly MORE workloads than the real one -- the
+    // same over-permissive failure as every other unresolved case here.
+    // Recorded after the block-scalar branch above, which already taints the
+    // parent for its own reason. Note `tier: ""` is NOT value-less: quotes
+    // survive stripTrailingComment/trim, so it stays a literal empty string.
+    if (value.length === 0) valuelessKeyParents.add(parentPath);
 
     if (value.length > 0) {
       const colonIdx = line.indexOf(":", dashIndent);
@@ -364,7 +439,7 @@ function scanFieldPaths(text: string, baseChar: number): { entries: FieldPathEnt
     // line, since that line's own popToForListItem/popOrdinary call pops
     // back to (but never past) this key's frame.
   }
-  return { entries, unresolvedContainers };
+  return { entries, unresolvedContainers, valuelessKeyParents };
 }
 
 function findEntry(entries: FieldPathEntry[], path: string): FieldPathEntry | undefined {
@@ -486,8 +561,12 @@ export const LABELS_PATH_BY_KIND: Record<string, string> = {
  *  exists, or any direct-child leaf is itself templated -- a partially-literal
  *  map is still unusable for subset-match without evaluating the templated
  *  half, so the whole map is treated as unresolved. */
-function extractLiteralLabelMap(prefix: string, entries: FieldPathEntry[], unresolvedContainers: Set<string>): ManifestLabelMap | null {
+function extractLiteralLabelMap(prefix: string, entries: FieldPathEntry[], unresolvedContainers: Set<string>, valuelessKeyParents: Set<string>): ManifestLabelMap | null {
   if (unresolvedContainers.has(prefix)) return null;
+  // A value-less direct child (`tier:`) never produced an entry at all, so the
+  // map below would come back without it -- see valuelessKeyParents' comment
+  // in scanFieldPaths for why a short map is the dangerous direction.
+  if (valuelessKeyParents.has(prefix)) return null;
   // A real Kubernetes label/selector map is always flat (string -> string) --
   // any entry whose parentPath is a DEEPER descendant of prefix (not prefix
   // itself) means some direct child of prefix was itself a nested container
@@ -524,7 +603,7 @@ function extractLiteralLabelMap(prefix: string, entries: FieldPathEntry[], unres
   return pairs.length > 0 ? Object.fromEntries(pairs) : null;
 }
 
-function buildDocument(text: string, docStartChar: number, entries: FieldPathEntry[], unresolvedContainers: Set<string>): K8sManifestDocument {
+function buildDocument(text: string, docStartChar: number, entries: FieldPathEntry[], unresolvedContainers: Set<string>, valuelessKeyParents: Set<string>): K8sManifestDocument {
   const kindEntry = findEntry(entries, "kind");
   const kind = kindEntry?.value.form === "literal" ? kindEntry.value.value : null;
   if (!kind || !ALLOWED_KINDS.has(kind)) return { resource: null, references: [], selector: null, labels: null };
@@ -535,21 +614,28 @@ function buildDocument(text: string, docStartChar: number, entries: FieldPathEnt
     : null;
 
   const references = [...extractFieldReferences(kind, entries), ...extractOwnerReferenceCandidates(entries)];
-  const selector = kind === "Service" ? extractLiteralLabelMap("spec.selector", entries, unresolvedContainers) : null;
+  const selector = kind === "Service" ? extractLiteralLabelMap("spec.selector", entries, unresolvedContainers, valuelessKeyParents) : null;
   const labelsPath = LABELS_PATH_BY_KIND[kind];
-  const labels = labelsPath ? extractLiteralLabelMap(labelsPath, entries, unresolvedContainers) : null;
+  const labels = labelsPath ? extractLiteralLabelMap(labelsPath, entries, unresolvedContainers, valuelessKeyParents) : null;
   return { resource, references, selector, labels };
 }
 
-// Matches a YAML document-start marker (`---`, optionally with a trailing
-// comment -- `--- # second doc` is legal YAML) or a document-end marker
-// (`...`). Without the trailing-comment allowance, a commented separator
-// silently failed to split at all, merging two documents into one -- the
-// later document's fields overwrite the earlier one's (object spread order),
-// and the earlier resource's symbol/edges vanish entirely. `----` (four or
-// more dashes) is deliberately NOT a separator -- real YAML doesn't treat it
-// as one either.
-const DOC_SEPARATOR = /^(?:---(?:[ \t]+#.*)?|\.\.\.)[ \t]*\r?$/m;
+// Matches a YAML document-start marker (`---`) or a document-end marker
+// (`...`). Per the YAML spec `---` FOLLOWED BY WHITESPACE starts a document
+// whatever trails it on that line -- a comment (`--- # second doc`), a tag
+// (`--- !!map`), an anchor (`--- &base`) -- so the trailing text is matched
+// generically rather than as a comment only. Without that, a tagged or
+// anchored separator silently failed to split at all, merging two documents
+// into one: the later document's fields overwrite the earlier one's (object
+// spread order), and the earlier resource's symbol/edges vanish entirely.
+// Whatever trails the marker is consumed WITH the boundary -- for a tag or
+// anchor nothing is lost, and inline content written after the marker
+// (`--- kind: Pod`, legal but vanishingly rare) is dropped, which errs toward
+// fewer edges, this module's standing bias. `----` (four or more dashes) is
+// deliberately NOT a separator -- real YAML doesn't treat it as one either,
+// and it still isn't here: the dashes must be followed by whitespace or end
+// of line.
+const DOC_SEPARATOR = /^(?:---(?:[ \t]+.*)?|\.\.\.)[ \t]*\r?$/m;
 
 export function extractK8sManifest(source: string): K8sManifestDocument[] {
   const docs: K8sManifestDocument[] = [];
@@ -561,8 +647,8 @@ export function extractK8sManifest(source: string): K8sManifestDocument[] {
     const start = starts[i]!;
     const end = ends[i]!;
     const text = source.slice(start, end);
-    const { entries, unresolvedContainers } = scanFieldPaths(text, start);
-    docs.push(buildDocument(text, start, entries, unresolvedContainers));
+    const { entries, unresolvedContainers, valuelessKeyParents } = scanFieldPaths(text, start);
+    docs.push(buildDocument(text, start, entries, unresolvedContainers, valuelessKeyParents));
   }
   return docs;
 }
