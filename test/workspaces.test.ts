@@ -558,6 +558,85 @@ test("CLI: snapshot writes nothing without an overlay (dry-run too), writes into
   } finally { cleanup(); }
 });
 
+/** Hunch publication is ADDITIVE: the memory pump never stages a tracked deletion (see
+ *  `stagedMemoryPaths` in src/extractors/git.ts). Deleting a `publish_public` workspace
+ *  record therefore used to strand `D .hunch/workspaces/<id>.json` in the working tree and
+ *  wedge every LATER public auto-commit. `forget` refuses it and prints the manual recipe. */
+test("CLI: forget refuses a record committed in the public .hunch/, keeps the file, and leaves later public auto-commits working", () => {
+  const { base, repo, cleanup } = fixture();
+  try {
+    const env = machineEnv(base, MACHINE);
+    writeFileSync(join(repo, ".hunch", "config.json"), JSON.stringify({ workspaces: { publish_public: true } }) + "\n");
+    // A FOREIGN machine's record, committed into the repo-tracked .hunch/ exactly as a
+    // publish_public snapshot on that machine would have left it.
+    const other = machineRecord(OTHER, new Date().toISOString(), [{ name: "fix/old" }]);
+    const store = new HunchStore(hunchPaths(repo));
+    try { store.json.ensureDirs(); store.json.put("workspaces", other); } finally { store.close(); }
+    const file = join(repo, ".hunch", "workspaces", `${workspaceId(OTHER.id)}.json`);
+    assert.ok(existsSync(file));
+    g(repo, "add", "-A"); g(repo, "commit", "-q", "-m", "hunch: public workspace record");
+    const commitsBefore = g(repo, "rev-list", "--count", "HEAD");
+
+    const forget = cli(repo, env, "workspaces", "forget", "other-box");
+    assert.notEqual(forget.status, 0, "nothing forgotten + one refused → non-zero exit");
+    assert.ok(existsSync(file), "the public record file is NOT deleted");
+    assert.match(forget.stdout, /refused: ws_[0-9a-f]+ \(other-box\) lives in this repo's \.hunch\//);
+    assert.match(forget.stdout, new RegExp(`git rm \\.hunch/workspaces/${workspaceId(OTHER.id)}\\.json`));
+    assert.match(forget.stdout, /git commit -m "hunch: forget workspace other-box"/);
+    assert.equal(g(repo, "status", "--porcelain", "--", ".hunch"), "", "no stranded `D .hunch/…` in the working tree");
+    assert.equal(g(repo, "rev-list", "--count", "HEAD"), commitsBefore, "a refusal commits nothing");
+
+    // The real damage the old behaviour did: a LATER public auto-commit must still land.
+    const snap = cli(repo, env, "workspaces", "snapshot");
+    assert.equal(snap.status, 0, snap.stderr);
+    assert.match(snap.stdout, /→ public \.hunch\/, committed/);
+    assert.match(g(repo, "log", "-1", "--format=%s"), /workspace snapshot test-box/);
+    assert.ok(existsSync(join(repo, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`)));
+    assert.equal(g(repo, "status", "--porcelain", "--", ".hunch"), "", "the public store stays clean");
+
+    assert.match(cli(repo, env, "workspaces", "forget", "nobody").stderr, /no workspace record/);
+  } finally { cleanup(); }
+});
+
+test("CLI: forget with both homes forgets the overlay record and reports the refused public one", () => {
+  const { base, repo, cleanup } = fixture();
+  try {
+    const env = machineEnv(base, MACHINE);
+    writeFileSync(join(repo, ".hunch", "config.json"), JSON.stringify({ workspaces: { publish_public: true } }) + "\n");
+    const overlayRoot = join(base, "overlay");
+    g(base, "init", "-q", "-b", "main", overlayRoot); cfg(overlayRoot);
+    mkdirSync(join(overlayRoot, ".hunch"), { recursive: true });
+    writeFileSync(join(overlayRoot, ".gitignore"), ".hunch/hunch.sqlite*\n");
+    g(overlayRoot, "add", "-A"); g(overlayRoot, "commit", "-q", "-m", "overlay");
+
+    // One record per home, under DIFFERENT machine ids (one home per record is the
+    // store's contract) but both matching `forget`'s label/id lookup by id.
+    const publicRecord = machineRecord(OTHER, new Date().toISOString(), [{ name: "fix/old" }]);
+    let store = new HunchStore(hunchPaths(repo));
+    try { store.json.ensureDirs(); store.json.put("workspaces", publicRecord); } finally { store.close(); }
+    g(repo, "add", "-A"); g(repo, "commit", "-q", "-m", "hunch: public workspace record");
+
+    writeFileSync(join(repo, ".hunch", "local.json"), JSON.stringify({ privateDir: join(overlayRoot, ".hunch"), autoCommit: true, mode: "private" }) + "\n");
+    const first = cli(repo, env, "workspaces", "snapshot");
+    assert.equal(first.status, 0, first.stderr);
+    const overlayFile = join(overlayRoot, ".hunch", "workspaces", `${workspaceId(MACHINE.id)}.json`);
+    assert.ok(existsSync(overlayFile), "this machine's record went to the overlay");
+
+    // Forget both by id in one run each: the overlay one goes, the public one is refused.
+    const overlayForget = cli(repo, env, "workspaces", "forget", "test-box");
+    assert.equal(overlayForget.status, 0, overlayForget.stderr);
+    assert.match(overlayForget.stdout, /forgot 1 record\(s\) for test-box/);
+    assert.equal(existsSync(overlayFile), false);
+
+    const publicFile = join(repo, ".hunch", "workspaces", `${workspaceId(OTHER.id)}.json`);
+    const publicForget = cli(repo, env, "workspaces", "forget", "other-box");
+    assert.notEqual(publicForget.status, 0);
+    assert.ok(existsSync(publicFile), "an overlay being configured does not make the public record deletable");
+    assert.match(publicForget.stdout, /git rm \.hunch\/workspaces\//);
+    assert.equal(g(repo, "status", "--porcelain", "--", ".hunch/workspaces"), "", "no stranded deletion");
+  } finally { cleanup(); }
+});
+
 test("CLI: label shows and sets the machine label, refusing unsafe values", () => {
   const base = mkdtempSync(join(tmpdir(), "hunch-ws-label-"));
   try {

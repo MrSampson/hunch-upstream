@@ -89,7 +89,7 @@ import { diffProjectDna } from "../core/projectDnaDelta.js";
 import { projectDnaDeliverySupplement } from "../core/projectDnaDelivery.js";
 import { readConfig, writeConfig, FIRMNESS_LEVELS, isFirmness, type Firmness, workspacesConfig } from "../core/config.js";
 import { loadOrCreateMachine, setMachineLabel, machineFile, labelLeaksIdentity } from "../core/machine.js";
-import { worktreeRows, branchRows } from "../core/workspace.js";
+import { worktreeRows, branchRows, publicWorkspaceRemovalRecipe } from "../core/workspace.js";
 import { workspaceLedgerView, recordWorkspaceSnapshot, renderWorktreeTable, renderBranchTable, workspaceSummaryLine, prunePlanFor, renderPrunePlan, applyPrune, confirmPrune, pruneConfirmQuestion } from "../integrations/workspaceLedger.js";
 import { blockingInScope, vetoInScope, proposedEditLines, type BlockingHit } from "../core/hookpolicy.js";
 import { isHumanConfirmed } from "../core/strictgate.js";
@@ -1514,7 +1514,10 @@ workspacesCmd
         case "unchanged":
           return console.log(`✓ unchanged since ${out.previous.observed_at} (${out.record.id}) — nothing written`);
         case "collision":
-          return fail(`not written: ${out.reason}\n  · \`hunch workspaces forget ${out.record.id}\` removes the stale copy (a normal, revertable memory move), then snapshot again`);
+          // The capture is routed to the overlay, so the only home it can collide with is
+          // this repo's committed `.hunch/`. `forget` refuses that record (an additive pump
+          // never stages a deletion), so the recipe here is the manual git removal.
+          return fail(`not written: ${out.reason}\n  the stale copy lives in this repo's .hunch/ — remove it by hand, then snapshot again:\n${publicWorkspaceRemovalRecipe(out.record.id, out.record.machine.label)}`);
         case "written":
           return console.log(`✓ recorded ${out.record.worktrees.length} worktree(s), ${out.record.branches.length} branch(es) as ${out.record.machine.label} (${out.record.id}, publish=${out.record.publish}) → ${out.home === "private" ? "overlay" : "public .hunch/"}${out.flushed ? `, ${out.flushed}` : ""}`);
       }
@@ -1587,11 +1590,25 @@ workspacesCmd
     try {
       const victims = store.recs("workspaces").filter((r) => r.machine.label === machine || r.machine.id === machine || r.id === machine);
       if (!victims.length) return fail(`no workspace record for "${machine}" — \`hunch workspaces\` lists the machines in memory`);
-      // Decide each record's home BEFORE deleting it, then flush exactly those homes.
-      const homes: MemoryHome[] = victims.map((v) => store.getPrivateRec("workspaces", v.id) ? "private" : "public");
-      for (const v of victims) store.deleteWhereItLives("workspaces", v.id);
-      pumpMemoryHomes(store, root, homes, `hunch: forget workspace ${machine}`);
-      console.log(`✓ forgot ${victims.length} record(s) for ${machine}`);
+      // Decide each record's home BEFORE deleting anything, then flush exactly those homes.
+      // A PUBLIC record (workspaces.publish_public) is refused rather than deleted: the
+      // memory pump never stages a tracked deletion, so removing the file here would strand
+      // `D .hunch/workspaces/<id>.json` and wedge every later auto-commit — see
+      // publicWorkspaceRemovalRecipe.
+      const overlay = victims.filter((v) => store.getPrivateRec("workspaces", v.id));
+      const refused = victims.filter((v) => !store.getPrivateRec("workspaces", v.id));
+      for (const v of overlay) store.deleteWhereItLives("workspaces", v.id);
+      if (overlay.length) {
+        pumpMemoryHome(store, root, "private", `hunch: forget workspace ${machine}`);
+        console.log(`✓ forgot ${overlay.length} record(s) for ${machine}`);
+      }
+      for (const v of refused) {
+        console.log(
+          `refused: ${v.id} (${v.machine.label}) lives in this repo's .hunch/ — Hunch publication is additive and never stages a deletion, so it is removed by hand:\n`
+          + publicWorkspaceRemovalRecipe(v.id, v.machine.label),
+        );
+      }
+      if (refused.length && !overlay.length) process.exitCode = 1;
     } finally {
       store.close();
     }

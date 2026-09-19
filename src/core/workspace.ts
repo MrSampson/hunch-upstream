@@ -424,6 +424,23 @@ export function pruneRefusal(b: WorkspaceBranch, wt: WorkspaceWorktree | undefin
   return null;
 }
 
+/** The repo-relative path of a workspace record committed into the PUBLIC `.hunch/`. */
+export function publicWorkspaceRecordPath(id: string): string {
+  return `.hunch/workspaces/${id}.json`;
+}
+
+/** The manual recipe for removing a workspace record that lives in the repo-tracked
+ *  `.hunch/`. Hunch's own publication pump is deliberately ADDITIVE — it refuses to stage
+ *  a tracked deletion so a stale clone can never erase team history (the same stance
+ *  `compact --apply` takes) — so deleting such a record here would strand `D .hunch/…` in
+ *  the working tree and wedge every later auto-commit. The removal is a normal, reviewable
+ *  git change the human makes instead. */
+export function publicWorkspaceRemovalRecipe(id: string, machine: string): string {
+  const path = publicWorkspaceRecordPath(id);
+  return `  · git rm ${path}   (never committed? delete the file instead)\n`
+    + `  · git commit -m "hunch: forget workspace ${machine}"`;
+}
+
 export function planPrune(live: Workspace, others: readonly Workspace[]): PrunePlan {
   const mine = pruneStepsFor(live, { skip: pruneRefusal });
   const plan: PrunePlan = { local: mine.steps, others: {}, skipped: mine.skipped };
