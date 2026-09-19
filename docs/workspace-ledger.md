@@ -146,6 +146,13 @@ mode (no overlay configured) the record is written to the repo-tracked `.hunch/`
 `workspaces.publish_public: true`; the default is to skip with a one-line `doctor` hint, because
 committing per-machine paths into the code repository is rarely wanted.
 
+A snapshot bound for the PUBLIC `.hunch/` is a commit on the checked-out code branch, so it
+**defers** (`deferred`, reason `git-operation-in-progress` or `detached-head`) whenever git is
+replaying history — rebase, merge, cherry-pick, revert, bisect — or HEAD is detached: `git rebase`
+itself fires post-checkout, and an untracked `ws_*.json` appearing mid-rebase makes
+`git rebase --continue` abort. Nothing is lost; the next branch checkout or ledger read records
+the machine. A private overlay is its own repository, so overlay snapshots never defer.
+
 Hook cost guard: the hook runs the snapshot in the background (`&`, the same shell pattern the
 post-commit capture line uses — nothing is detach-spawned any more) and skips the write when the
 stored record is younger than one day and its content is unchanged, so `git checkout` latency is

@@ -1849,6 +1849,26 @@ export function currentBranch(cwd: string): string {
   return b === "HEAD" ? "" : b; // detached HEAD reports "HEAD" — treat as no branch
 }
 
+/** The state files git writes while it is replaying history. `git rev-parse --git-path`
+ *  resolves each against THIS worktree's private git dir (a linked worktree keeps its own
+ *  rebase-merge/MERGE_HEAD), so a rebase in one worktree never reads as one in another. */
+const UNSETTLED_HEAD_PATHS = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"] as const;
+
+/** Whether HEAD is somewhere a write must not land: mid rebase/merge/cherry-pick/revert/bisect
+ *  ("git-operation-in-progress", which wins when both hold), or detached ("detached-head").
+ *  null when HEAD is a settled branch — and also when git cannot answer at all (not a repo,
+ *  git missing), so a caller keeps its pre-existing behavior rather than failing closed. */
+export function gitHeadUnsettled(cwd: string): "git-operation-in-progress" | "detached-head" | null {
+  // One spawn: `git rev-parse --git-path a --git-path b …` prints one line per path.
+  const out = gitSafe(["rev-parse", ...UNSETTLED_HEAD_PATHS.flatMap((p) => ["--git-path", p])], cwd);
+  if (!out) return null; // git could not answer (not a repo) — fail open
+  const paths = out.split("\n").map((p) => p.trim()).filter(Boolean);
+  if (paths.length !== UNSETTLED_HEAD_PATHS.length) return null;
+  if (paths.some((p) => existsSync(isAbsolute(p) ? p : resolve(cwd, p)))) return "git-operation-in-progress";
+  // `git symbolic-ref -q HEAD` exits non-zero exactly when HEAD is detached.
+  return gitSafe(["symbolic-ref", "-q", "HEAD"], cwd) ? null : "detached-head";
+}
+
 /** Files changed in a single commit. `--root` makes the initial commit (which
  *  has no parent) report its files as additions instead of returning nothing. */
 export function commitFiles(sha: string, cwd: string): string[] {

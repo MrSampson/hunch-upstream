@@ -11,7 +11,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
-import { foreignRepoEnv, mainWorktreeRoot } from "../extractors/git.js";
+import { foreignRepoEnv, gitHeadUnsettled, mainWorktreeRoot } from "../extractors/git.js";
 import { hunchPaths } from "../core/paths.js";
 import { readConfig, workspacesConfig, type WorkspacesConfig } from "../core/config.js";
 import { loadOrCreateMachine, type MachineIdentity } from "../core/machine.js";
@@ -49,6 +49,12 @@ export type SnapshotOutcome =
    *  copy, or a record someone else wrote under this id): the store refuses a twin, and so
    *  do we — `hunch workspaces forget <id>` removes the stale copy. */
   | { status: "collision"; record: Workspace; reason: string }
+  /** A PUBLIC-home snapshot is a commit on the checked-out code branch. While git is replaying
+   *  history (rebase / merge / cherry-pick / revert / bisect) or HEAD is detached, that write
+   *  would land in the middle of the operation — an untracked `ws_*.json` that makes
+   *  `git rebase --continue` abort, or a commit no branch owns. Nothing is lost: the next
+   *  branch checkout or ledger read records this machine. */
+  | { status: "deferred"; record: Workspace; reason: "git-operation-in-progress" | "detached-head" }
   | { status: "written"; record: Workspace; home: "private" | "public"; flushed: "pushed" | "committed" | null };
 
 /** Record this machine's snapshot. Honors `workspaces.publish`, skips a write when the
@@ -69,6 +75,13 @@ export function recordWorkspaceSnapshot(store: HunchStore, root: string, opts: {
   const previous = store.getRec("workspaces", record.id);
   if (previous && Date.now() - Date.parse(previous.observed_at) < 86_400_000 && sameWorkspaceContent(previous, record)) {
     return { status: "unchanged", record, previous };
+  }
+  // Checked as late as possible (the live snapshot above takes time, and a rebase can start or
+  // finish while it runs). A private overlay is its own repository, whose commits never touch
+  // the code branch, so only a PUBLIC home defers.
+  if (!isPrivate) {
+    const unsettled = gitHeadUnsettled(root);
+    if (unsettled) return { status: "deferred", record, reason: unsettled };
   }
   try {
     store.putCapture("workspaces", record, isPrivate);
