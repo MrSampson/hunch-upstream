@@ -8,6 +8,7 @@ export const changelogLocales = {
       footer: "© Hunch — תיעוד משותף לסוכני AI.", home: "בית", githubReleases: "גרסאות ב-GitHub"
     },
     titles: [
+      "שומר על מה שתיעדת",
       "גבולות הדוקים יותר",
       "בדיקות וניקוי בטוחים יותר",
       "גישה, שימוש חוזר, סדר",
@@ -79,6 +80,7 @@ export const changelogLocales = {
       footer: "© Hunch — общие записи для ИИ-агентов.", home: "Главная", githubReleases: "Релизы на GitHub"
     },
     titles: [
+      "Сохраняет то, что вы записали",
       "Более строгие границы",
       "Надёжнее проверки и очистка",
       "Доступ, повторное использование, порядок",
@@ -150,6 +152,7 @@ export const changelogLocales = {
       footer: "© Hunch — سجل مشترك لوكلاء الذكاء الاصطناعي.", home: "الرئيسية", githubReleases: "الإصدارات على GitHub"
     },
     titles: [
+      "يحافظ على ما سجّلته",
       "حدود أكثر إحكامًا",
       "فحوصات وتنظيف أكثر أمانًا",
       "الوصول، إعادة الاستخدام، الترتيب",
@@ -221,6 +224,7 @@ export const changelogLocales = {
       footer: "© Hunch — un registro compartido para agentes de IA.", home: "Inicio", githubReleases: "Versiones en GitHub"
     },
     titles: [
+      "Conserva lo que registraste",
       "Límites más estrictos",
       "Controles y limpieza más seguros",
       "Alcance, reutilización, orden",
