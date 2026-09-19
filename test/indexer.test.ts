@@ -1779,3 +1779,214 @@ test("mergeScannedEdges keeps the carried edge on an id collision", () => {
   assert.deepEqual(merged, [carried, freshScan], "the carried edge wins, the non-colliding scan is appended");
   assert.equal(new Set(merged.map((e) => e.id)).size, merged.length, "no duplicate ids");
 });
+
+// Issue #297 gap 1: a Kubernetes reference resolves WITHIN a namespace. A
+// MISSING namespace is UNKNOWN and matches anything; two DIFFERENT literal
+// namespaces block the edge.
+
+test("same-named ConfigMaps in namespaces a and b: a Deployment in a resolves only to the one in a", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-idx-k8sns-pick-"));
+  mkdirSync(join(root, "templates"), { recursive: true });
+  writeFileSync(join(root, "Chart.yaml"), `apiVersion: v2\nname: mychart\nversion: 0.1.0\n`);
+  writeFileSync(join(root, "templates/configmap-a.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: shared-name\n  namespace: a\n`);
+  writeFileSync(join(root, "templates/configmap-b.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: shared-name\n  namespace: b\n`);
+  writeFileSync(join(root, "templates/deployment.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: a
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        envFrom:
+        - configMapRef:
+            name: shared-name
+`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+
+  const syms = store.json.loadAll("symbols");
+  const deployment = syms.find((s) => s.name === "Deployment/my-app");
+  const cmA = syms.find((s) => s.name === "ConfigMap/shared-name" && s.file === "templates/configmap-a.yaml");
+  const cmB = syms.find((s) => s.name === "ConfigMap/shared-name" && s.file === "templates/configmap-b.yaml");
+  assert.ok(deployment && cmA && cmB, "all three resource symbols indexed");
+
+  const edges = store.json.loadAll("edges");
+  assert.ok(edges.some((e) => e.from === deployment!.id && e.to === cmA!.id && e.type === "references"), "namespace a disambiguates what was previously an ambiguous 2-candidate match");
+  assert.equal(edges.some((e) => e.from === deployment!.id && e.to === cmB!.id), false, "the same-named ConfigMap in namespace b is never targeted");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("a Deployment with no namespace still resolves to a single ConfigMap in namespace b (unknown matches anything)", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-idx-k8sns-unknown-"));
+  mkdirSync(join(root, "templates"), { recursive: true });
+  writeFileSync(join(root, "Chart.yaml"), `apiVersion: v2\nname: mychart\nversion: 0.1.0\n`);
+  writeFileSync(join(root, "templates/configmap.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: b\n`);
+  writeFileSync(join(root, "templates/deployment.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        envFrom:
+        - configMapRef:
+            name: my-config
+`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+
+  const syms = store.json.loadAll("symbols");
+  const deployment = syms.find((s) => s.name === "Deployment/my-app");
+  const configMap = syms.find((s) => s.name === "ConfigMap/my-config");
+  const edges = store.json.loadAll("edges");
+  assert.ok(edges.some((e) => e.from === deployment!.id && e.to === configMap!.id && e.type === "references"), "an unknown namespace must not start blocking edges that resolved before");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("a Deployment in namespace a does NOT resolve to the only ConfigMap when that ConfigMap is in namespace b", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-idx-k8sns-cross-"));
+  mkdirSync(join(root, "templates"), { recursive: true });
+  writeFileSync(join(root, "Chart.yaml"), `apiVersion: v2\nname: mychart\nversion: 0.1.0\n`);
+  writeFileSync(join(root, "templates/configmap.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: b\n`);
+  writeFileSync(join(root, "templates/deployment.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: a
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        envFrom:
+        - configMapRef:
+            name: my-config
+`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+
+  const syms = store.json.loadAll("symbols");
+  const deployment = syms.find((s) => s.name === "Deployment/my-app");
+  const configMap = syms.find((s) => s.name === "ConfigMap/my-config");
+  assert.ok(deployment && configMap, "both resource symbols indexed");
+  const edges = store.json.loadAll("edges");
+  assert.equal(edges.some((e) => e.from === deployment!.id && e.to === configMap!.id), false, "two different literal namespaces block the edge");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("a reference in namespace a with one candidate in a and one with no namespace is ambiguous -- no edge", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-idx-k8sns-ambig-"));
+  mkdirSync(join(root, "templates"), { recursive: true });
+  writeFileSync(join(root, "Chart.yaml"), `apiVersion: v2\nname: mychart\nversion: 0.1.0\n`);
+  writeFileSync(join(root, "templates/configmap-a.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: shared-name\n  namespace: a\n`);
+  writeFileSync(join(root, "templates/configmap-unknown.yaml"), `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: shared-name\n`);
+  writeFileSync(join(root, "templates/deployment.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: a
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        envFrom:
+        - configMapRef:
+            name: shared-name
+`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+
+  const syms = store.json.loadAll("symbols");
+  const deployment = syms.find((s) => s.name === "Deployment/my-app");
+  const edges = store.json.loadAll("edges");
+  assert.equal(edges.filter((e) => e.type === "references" && e.from === deployment!.id).length, 0, "an unknown-namespace candidate stays compatible, so two candidates survive the filter and the existing don't-guess rule declines");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("a Service's selector in namespace a binds a label-matching workload with no namespace but NOT one in namespace b", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-idx-k8sns-sel-"));
+  mkdirSync(join(root, "manifests"), { recursive: true });
+  writeFileSync(join(root, "Chart.yaml"), `apiVersion: v2\nname: mychart\nversion: 0.1.0\n`);
+  writeFileSync(join(root, "manifests/service.yaml"), `
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  namespace: a
+spec:
+  selector:
+    app: my-app
+`);
+  writeFileSync(join(root, "manifests/deployment-b.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-in-b
+  namespace: b
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+`);
+  writeFileSync(join(root, "manifests/deployment-unknown.yaml"), `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-no-ns
+spec:
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+`);
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  indexRepo(store, root, { churn: false });
+  store.reindex();
+
+  const syms = store.json.loadAll("symbols");
+  const service = syms.find((s) => s.name === "Service/my-service");
+  const inB = syms.find((s) => s.name === "Deployment/app-in-b");
+  const noNs = syms.find((s) => s.name === "Deployment/app-no-ns");
+  assert.ok(service && inB && noNs, "all three resource symbols indexed");
+
+  const edges = store.json.loadAll("edges");
+  assert.equal(edges.some((e) => e.from === service!.id && e.to === inB!.id), false, "a Service never selects pods in another namespace, however well the labels match");
+  assert.ok(edges.some((e) => e.from === service!.id && e.to === noNs!.id && e.type === "references"), "an unknown-namespace workload still matches");
+
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});

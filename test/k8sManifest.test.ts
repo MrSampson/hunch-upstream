@@ -1014,3 +1014,111 @@ test("an indented `--- !!map` inside a block-scalar body does not split the file
   assert.equal(docs.length, 1, "an indented tagged separator is block-scalar text, not a document boundary");
   assert.equal(docs[0]!.resource?.kind, "ConfigMap");
 });
+
+// Issue #297 gap 1: a reference must not resolve across namespaces. A MISSING
+// namespace is UNKNOWN and matches anything; two DIFFERENT literal namespaces
+// block the edge.
+
+test("a literal metadata.namespace is parsed onto the resource", () => {
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: prod\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, "prod");
+});
+
+test("an absent metadata.namespace reads as null (unknown), not as an empty string", () => {
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("an explicitly empty metadata.namespace reads as null (unknown)", () => {
+  // `namespace: ""` names no namespace this scanner can compare against, so
+  // it must not become a literal "" that blocks every real namespace.
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: ""\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("a value-less metadata.namespace key reads as null (unknown)", () => {
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace:\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("a quoted metadata.namespace has its quotes stripped, same as the name", () => {
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: "prod"\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, "prod");
+});
+
+test("a templated metadata.namespace reads as null (unknown), never as a template-keyed literal", () => {
+  // A namespace is only ever a FILTER here, not a resolution key: blocking an
+  // edge because one side spells the namespace via {{ .Release.Namespace }}
+  // and the other spells it out would be a false negative.
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: {{ .Release.Namespace }}\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("a trailing comment is stripped from metadata.namespace", () => {
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: prod  # where it lives\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, "prod");
+});
+
+test("a CRLF-terminated metadata.namespace line parses without the carriage return", () => {
+  const src = `apiVersion: v1\r\nkind: ConfigMap\r\nmetadata:\r\n  name: my-config\r\n  namespace: prod\r\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, "prod");
+});
+
+test("a reference made by a document carries that document's namespace", () => {
+  const src = [
+    `apiVersion: apps/v1`, `kind: Deployment`,
+    `metadata:`, `  name: my-app`, `  namespace: prod`,
+    `spec:`, `  template:`, `    spec:`, `      containers:`,
+    `      - name: app`, `        envFrom:`, `        - configMapRef:`,
+    `            name: my-config`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.references.length, 1);
+  assert.equal(doc!.references[0]!.namespace, "prod");
+});
+
+test("an HTTPRoute backendRef's own namespace sibling overrides the document's namespace", () => {
+  // The one shape in fieldSpecsForKind that Kubernetes lets point across
+  // namespaces (Gateway API cross-namespace backendRefs).
+  const src = [
+    `apiVersion: gateway.networking.k8s.io/v1`, `kind: HTTPRoute`,
+    `metadata:`, `  name: my-route`, `  namespace: prod`,
+    `spec:`, `  rules:`, `  - backendRefs:`,
+    `    - name: my-service`, `      namespace: other`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.references.length, 1);
+  assert.equal(doc!.references[0]!.namespace, "other", "the explicit sibling wins over the document's own namespace");
+});
+
+test("an HTTPRoute backendRef with no namespace sibling falls back to the document's namespace", () => {
+  const src = [
+    `apiVersion: gateway.networking.k8s.io/v1`, `kind: HTTPRoute`,
+    `metadata:`, `  name: my-route`, `  namespace: prod`,
+    `spec:`, `  rules:`, `  - backendRefs:`,
+    `    - name: my-service`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.references[0]!.namespace, "prod");
+});
+
+test("an HTTPRoute backendRef whose namespace sibling is templated reads as unknown, NOT as the document's namespace", () => {
+  // An explicit-but-unreadable sibling states the target is elsewhere; falling
+  // back to the document's namespace would be a confident wrong answer.
+  const src = [
+    `apiVersion: gateway.networking.k8s.io/v1`, `kind: HTTPRoute`,
+    `metadata:`, `  name: my-route`, `  namespace: prod`,
+    `spec:`, `  rules:`, `  - backendRefs:`,
+    `    - name: my-service`, `      namespace: {{ .Values.ns }}`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.references[0]!.namespace, null);
+});
