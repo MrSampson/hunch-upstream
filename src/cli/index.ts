@@ -4336,6 +4336,45 @@ program
     store.close();
   });
 
+// ---- retire-constraint -----------------------------------------------------
+program
+  .command("retire-constraint")
+  .description("Retire an active constraint: close its valid-time window (invalidate, don't delete) so `hunch check` and the strict hook stop enforcing it.")
+  .argument("<id>", "constraint id (con_*)")
+  .option("--reason <text>", "why it's being retired — recorded in the commit body, never the subject")
+  .action((id: string, opts: { reason?: string }) => {
+    const { store, root } = storeFor();
+    const existing = store.getRec("constraints", id);
+    if (!existing) { store.close(); return fail(`constraint "${id}" not found`); }
+    if (existing.status === "retired") {
+      store.close();
+      return fail(`constraint "${id}" is already retired — window closed at ${existing.valid_to?.slice(0, 10) ?? "unknown"}.`);
+    }
+    // Which store already holds the record decides where the close is written —
+    // same rule supersede applies to a decision's home (decisionMemoryHome).
+    const home: MemoryHome = store.getPrivateRec("constraints", id) ? "private" : "public";
+    const retired = store.retireConstraint(existing);
+    store.reindex();
+    // Public grounding docs (CLAUDE.md's Top invariants list) are a publishable
+    // artifact: flushMemoryHome regenerates them on the SAME commit when auto-commit
+    // is on, but no commit happens to carry that refresh when it's off, so do it here
+    // too — otherwise a retired constraint keeps showing as enforced on disk (the same
+    // gap record-constraint and `conform --add` close for their own capture path).
+    if (home === "public" && !store.autoCommit) refreshExistingGrounding(root, store);
+    // `--reason` goes in the commit BODY, never the subject: `hunch log`'s move
+    // classifier (src/core/memorylog.ts) regexes the commit SUBJECT for keywords
+    // like "supersed"/"repair"/"adopt"/"capture", so free-form reason text landing
+    // in the subject could accidentally match one and misclassify the move.
+    const willCommit = home === "private" ? store.privateAutoCommit : store.autoCommit;
+    const message = `hunch: retire constraint ${id}${opts.reason ? `\n\n${opts.reason}` : ""}`;
+    pumpMemoryHome(store, root, home, message);
+    console.log(`✓ ${retired.id} retired — window closed at ${retired.valid_to?.slice(0, 10)}.`);
+    if (opts.reason && !willCommit) {
+      console.log("  ⚠ --reason is not recorded anywhere: auto-commit is off, so no commit message captured it.");
+    }
+    store.close();
+  });
+
 // ---- firmness (agent-hook enforcement level) ------------------------------
 program
   .command("firmness")
