@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, realpath
 import { spawnSync } from "node:child_process";
 import { join, isAbsolute, dirname, basename, relative, resolve } from "node:path";
 import { homedir } from "node:os";
-import { hooksDir, gitCommonDir } from "../extractors/git.js";
+import { hooksDir, gitCommonDir, isLinkedWorktree } from "../extractors/git.js";
 import { initiatorChildEnv } from "../synthesis/initiator.js";
 import { HUNCH_NPX_PACKAGE_SPEC } from "../core/version.js";
 
@@ -31,15 +31,27 @@ interface BlockContext { checkoutType: string }
 const GIT_CONTEXT: BlockContext = { checkoutType: "$3" };
 const PRE_COMMIT_CONTEXT: BlockContext = { checkoutType: "$PRE_COMMIT_CHECKOUT_TYPE" };
 
-type BlockBuilder = (invocation: string, ctx: BlockContext) => string;
+/** What an existing SHARED block carries that a worktree-local re-run must not
+ *  take away (issue #316): its own option flags (BLOCK_FLAGS), and the
+ *  post-commit block's local-only provider line. A builder ORs these into the
+ *  caller's options; one with no options ignores them. */
+interface KeptOptions { flags: readonly string[]; localOnly: boolean }
 
-function block(invocation: string, opts: { private?: boolean; commit?: boolean; localOnly?: boolean } = {}): string {
+type BlockBuilder = (invocation: string, ctx: BlockContext, keep?: KeptOptions) => string;
+
+const LOCAL_ONLY_LINE = "  export HUNCH_SYNTH_PROVIDER=deterministic";
+// Tolerates hand-added quotes: missing the line would let a re-run delete it.
+const LOCAL_ONLY_RE = /^\s*export HUNCH_SYNTH_PROVIDER=["']?deterministic["']?\s*$/m;
+/** How the provider line is named among a result's kept/added options. */
+const LOCAL_ONLY_LABEL = "HUNCH_SYNTH_PROVIDER=deterministic";
+
+function block(invocation: string, opts: { private?: boolean; commit?: boolean; localOnly?: boolean } = {}, keep?: KeptOptions): string {
   // --private routes the auto-synthesized decision into the HUNCH_PRIVATE_DIR overlay
   // instead of the public repo. --commit (opt-in) also commits & pushes the repo the
   // decision landed in (the private store under --private, else this repo). The hook
   // script is local (.git/hooks/), never committed.
-  const priv = opts.private ? " --private" : "";
-  const commit = opts.commit ? " --commit" : "";
+  const priv = opts.private || keep?.flags.includes("--private") ? " --private" : "";
+  const commit = opts.commit || keep?.flags.includes("--commit") ? " --commit" : "";
   return [
     MARK,
     'if [ -z "$HUNCH_SYNC" ]; then',
@@ -47,7 +59,7 @@ function block(invocation: string, opts: { private?: boolean; commit?: boolean; 
     // A split-private capture must not make a storage-private promise and then
     // ship the commit diff to a subscription CLI. Shared overlays are a separate
     // team policy, so only the explicit local-only mode forces deterministic.
-    ...(opts.localOnly ? ["  export HUNCH_SYNTH_PROVIDER=deterministic"] : []),
+    ...(opts.localOnly || keep?.localOnly ? [LOCAL_ONLY_LINE] : []),
     `  ( ${invocation} sync --from-hook --quiet${priv}${commit} >/dev/null 2>&1 || true ) &`,
     // Deliberately NO workspace-ledger snapshot here (docs/workspace-ledger.md): a commit
     // changes HEAD, not which branches and worktrees exist — post-checkout covers that, and
@@ -73,17 +85,45 @@ export interface HookInstall {
   /** The hook file written; for a non-writing result, the file the user should edit. */
   path: string;
   /** created/appended/updated/unchanged: the block is (now) in a file git reaches.
+   *  kept-shared: the shared hook already runs a Hunch that is not inside a
+   *  linked worktree, so it was deliberately left as it is rather than
+   *  re-pointed at one (issue #316); a success, not a failure.
    *  managed-elsewhere: a hook manager owns the hook — nothing was written.
-   *  unreachable: the existing hook ends in exec/exit before our block — nothing was written. */
-  action: "created" | "appended" | "updated" | "unchanged" | "managed-elsewhere" | "unreachable";
+   *  unreachable: the existing hook ends in exec/exit before our block, or the
+   *  block in it has no closing marker and so cannot be replaced in place —
+   *  nothing was written. */
+  action: "created" | "appended" | "updated" | "unchanged" | "kept-shared" | "managed-elsewhere" | "unreachable";
   manager?: HookManagerKind;
   /** Why nothing was written (non-writing actions only). */
   reason?: string;
   /** What to add to `path` by hand (non-writing actions only). */
   snippet?: string;
-  /** The file already carries a Hunch block, but a dead one: the snippet
-   *  REPLACES it rather than being added (non-writing actions only). */
+  /** The file already carries a Hunch block — a dead one, or one that cannot be
+   *  updated in place: the snippet REPLACES it rather than being added
+   *  (non-writing actions only). */
   stale?: boolean;
+  /** The block that could not be updated still RUNS as it is (it only lacks its
+   *  closing marker), so the failure is this run's update, not the install. */
+  live?: boolean;
+  /** The block in the file deliberately runs the repo's EXISTING shared
+   *  invocation instead of the caller's worktree-bound one (issue #316). Set on
+   *  kept-shared, and on created/appended/updated when that substitution happened. */
+  sharedInvocation?: string;
+  /** The options the existing SHARED block carries that this run did not ask for
+   *  and that were kept anyway — its own flags (BLOCK_FLAGS), e.g. a strict
+   *  pre-commit guard that a worktree's advisory re-run must not silently
+   *  downgrade, and the post-commit block's local-only provider line (named
+   *  `HUNCH_SYNTH_PROVIDER=deterministic`). Set on kept-shared, and on updated
+   *  when the run also added an option of its own. */
+  keptFlags?: string[];
+  /** The options this run ADDED to the existing shared block (updated only). */
+  addedFlags?: string[];
+  /** Set when a DEAD block was rebuilt from the repo's shared launcher and the
+   *  previous block's own option flags were not requested again. Reported, not
+   *  restored: the flags come from the caller's options, so re-adding one would
+   *  invent a request nobody made — but losing a strict guard in silence is
+   *  exactly the issue-#316 failure mode. */
+  droppedFlags?: string[];
 }
 
 function escapeRe(s: string): string {
@@ -411,6 +451,38 @@ function blockFlags(line: string): string[] {
   return BLOCK_FLAGS.filter((f) => new RegExp(`(?:^|\\s)${escapeRe(f)}(?=\\s|$)`).test(line));
 }
 
+/** The flags a freshly BUILT block carries, read the way `inspectBlock` reads an
+ *  installed one: per command line, only from the text after the subcommand. A
+ *  whole-block scan would count a flag that is merely part of the launcher path
+ *  (a Hunch installed under `…/opt --strict x/…`), and so miss a real downgrade.
+ *
+ *  With `liveRoot`, only lines whose launcher works are read — for an INSTALLED
+ *  block's text, where a dead hand-kept line's `--commit` was never in effect
+ *  and carrying it into a rebuild would switch it on. */
+function builtFlags(blk: string, mark: string, liveRoot?: string): string[] {
+  const { re } = blockSubcommand(mark);
+  const found = new Set<string>();
+  for (const line of blk.replace(/\r/g, "").split("\n")) {
+    if (line.trim().startsWith("#")) continue;
+    const m = re.exec(line);
+    if (!m) continue;
+    if (liveRoot !== undefined && !hookInvocationHealth(line.slice(0, m.index), liveRoot).ok) continue;
+    for (const f of blockFlags(line.slice(m.index))) found.add(f);
+  }
+  return BLOCK_FLAGS.filter((f) => found.has(f));
+}
+
+/** The text of `mark`'s block in `cur` (which must contain `mark`): through its
+ *  closing marker, or — when that is missing — up to the next Hunch marker line,
+ *  so another block's command further down is never read as this block's. */
+function ownBlockText(cur: string, mark: string, blockRe: RegExp): string {
+  const m = blockRe.exec(cur);
+  if (m) return m[0];
+  const lines = cur.slice(cur.indexOf(mark)).split("\n");
+  const stop = lines.findIndex((l, i) => i > 0 && /^# (?:<<<|>>>) hunch /.test(l));
+  return (stop < 0 ? lines : lines.slice(0, stop)).join("\n");
+}
+
 /** A block's health plus Hunch's own option flags the reported line carried
  *  after the subcommand (an intersection: the health stays a discriminated union). */
 type BlockInspection = HookInvocationHealth & { flags: string[] };
@@ -512,6 +584,108 @@ function snippetFor(t: HookTarget, mark: string, build: BlockBuilder, localInvoc
   return build(PORTABLE_HOOK_INVOCATION, GIT_CONTEXT);
 }
 
+/** The repo's worktree tops as `git worktree list --porcelain` reports them:
+ *  `linked` is every entry AFTER the first (the first is always the main
+ *  worktree, or the bare repo) that is not the bare entry, and `count` is how
+ *  many non-bare worktrees the repo has — the number the shared-hooks note
+ *  quotes, which must not include a bare repo's phantom entry. Entries are
+ *  separated by blank lines and each starts with a `worktree <path>` line.
+ *  Read straight from git rather than the workspace ledger: this runs during
+ *  `hunch init`, before any ledger exists. */
+function worktreeTops(root: string): { linked: string[]; count: number } {
+  const out = gitRun(["worktree", "list", "--porcelain"], root).stdout;
+  if (!out) return { linked: [], count: 0 };
+  const entries = out.replace(/\r/g, "").split(/\n\s*\n/).map((e) => e.split("\n"));
+  const parsed = entries
+    .map((lines) => ({
+      path: lines.find((l) => l.startsWith("worktree "))?.slice("worktree ".length) ?? "",
+      bare: lines.some((l) => l.trim() === "bare"),
+    }))
+    .filter((e) => e.path !== "");
+  return { linked: parsed.slice(1).filter((e) => !e.bare).map((e) => e.path), count: parsed.filter((e) => !e.bare).length };
+}
+
+/** The LINKED worktree an invocation is bound to — one it can only work from
+ *  inside, because some token is an absolute path under it (that worktree's own
+ *  node_modules install, its own source checkout) — or null.
+ *
+ *  "Inside" counts textually OR physically: a node_modules symlinked out of a
+ *  worktree still dies with `git worktree remove`, and a path spelled through
+ *  the main checkout that realpaths into a worktree is just as bound. A
+ *  RELATIVE path token is bound to nothing: the shell resolves it against the
+ *  hook's own cwd at run time, which is whichever worktree git is running in,
+ *  so it stays correct for all of them. */
+function worktreeBound(invocation: string, tops: string[]): string | null {
+  const toks = shellWords(invocation);
+  if (toks === null) return null;
+  const norm = (p: string) => (process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+  const textuallyInside = (top: string, tok: string): boolean => {
+    const rel = relative(norm(top), norm(tok));
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  for (const top of tops) {
+    if (toks.some((t) => isAbs(t) && (textuallyInside(top, t) || isInside(top, t)))) return top;
+  }
+  return null;
+}
+
+/** The (hookName, mark) pairs of every managed block Hunch writes — the sibling
+ *  blocks that share one hooks dir, scanned for a working shared launcher.
+ *  Resolved inside a function (like `preCommitId`) because the marks are
+ *  declared further down. */
+function managedBlocks(): [string, string][] {
+  return [
+    ["post-commit", MARK],
+    ["pre-commit", PRE_MARK],
+    ["post-merge", GROUNDING_MERGE_MARK],
+    ["post-merge", REPAIR_MERGE_MARK],
+    ["post-checkout", CHECKOUT_MARK],
+  ];
+}
+
+/** The repo's existing SHARED invocation to install instead of `invocation`, or
+ *  null to go on as normal (issue #316).
+ *
+ *  Linked worktrees share ONE `<git-common-dir>/hooks` directory. Rebuilding a
+ *  block from a path inside a linked worktree therefore re-points the main
+ *  checkout's and every sibling worktree's hooks at code that disappears with
+ *  `git worktree remove` — leaving all of them dead. So when the repo already
+ *  runs a Hunch bound to NO linked worktree, that invocation wins. The gate is
+ *  the caller's invocation, not `root`: an install run from the MAIN checkout
+ *  with a worktree-bound launcher poisons the shared hooks exactly the same way.
+ *
+ *  `own: true` means the block for THIS mark already carries it (the caller must
+ *  also preserve the flags it carries). Otherwise the answer came from a sibling
+ *  block: `hunch index` self-heals a missing post-merge/post-checkout hook and
+ *  agents run it from worktrees constantly — a missing block must not become the
+ *  way a worktree path gets into the shared hooks while the repo already has a
+ *  working shared launcher. */
+function sharedInvocationFor(root: string, mark: string, invocation: string, own: BlockInfo): { invocation: string; own: boolean; flags: string[] } | null {
+  const tops = worktreeTops(root).linked;
+  if (tops.length === 0 || !worktreeBound(invocation, tops)) return null;
+
+  if (own.state === "installed") {
+    // A bound invocation always differs from an unbound one, so no separate
+    // "did it change?" test is needed to avoid a pointless rewrite.
+    return own.invocation && !worktreeBound(own.invocation, tops)
+      ? { invocation: own.invocation, own: true, flags: own.flags ?? [] }
+      : null;
+  }
+
+  for (const [hookName, m] of managedBlocks()) {
+    if (m === mark) continue;
+    const info = blockInfo(resolveHookTarget(root, hookName, m), m, root);
+    if (info.state === "installed" && info.invocation && !worktreeBound(info.invocation, tops)) {
+      // A rebuilt block gets its options from the CALLER, so `own.flags` are
+      // the ones the old block carried that this run may be dropping — reported
+      // (droppedFlags), never restored: restoring one would fabricate a request
+      // nobody made.
+      return { invocation: info.invocation, own: false, flags: own.flags ?? [] };
+    }
+  }
+  return null;
+}
+
 /** Shared idempotent create/append/update-in-place logic for every hunch git
  *  hook: write a fresh hook file, replace our own managed block in place if the
  *  invocation changed, or append after any pre-existing (non-hunch) hook body
@@ -540,33 +714,93 @@ function installManagedBlock(root: string, hookName: string, mark: string, end: 
     };
   }
 
-  const blk = build(invocation, GIT_CONTEXT);
+  // Issue #316: the hooks dir is shared with every linked worktree, so prefer
+  // the repo's existing unbound command over a caller path that dies with a
+  // worktree. The invocation text comes from blockInfo, i.e. straight out of the block's
+  // command line with its quoting intact, and inspectBlock only calls a block
+  // healthy when shellWords parsed it into plain words with no shell
+  // metacharacters — so re-embedding that exact text in build() is safe.
+  const info = blockInfo(t, mark, root);
+  const shared = sharedInvocationFor(root, mark, invocation, info);
+  const blk = build(shared?.invocation ?? invocation, GIT_CONTEXT);
+  // A dead own block rebuilt from a SIBLING's launcher keeps neither its command
+  // nor its options; say which options went, so a downgraded strict guard is not
+  // the user's to discover later.
+  // The local-only provider line is such an option too: a privacy promise that
+  // goes must be named, exactly like a flag.
   const hookPath = t.hookPath;
+  const cur = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : null;
+  const blockRe = new RegExp(`${escapeRe(mark)}[\\s\\S]*?${escapeRe(end)}`);
+  const own = cur?.includes(mark) ? ownBlockText(cur, mark, blockRe) : "";
+  const lost = shared && !shared.own
+    ? [...shared.flags.filter((f) => !builtFlags(blk, mark).includes(f)), ...(LOCAL_ONLY_RE.test(own) && !LOCAL_ONLY_RE.test(blk) ? [LOCAL_ONLY_LABEL] : [])]
+    : [];
+  const sharedNote = shared ? { sharedInvocation: shared.invocation, ...(lost.length > 0 ? { droppedFlags: lost } : {}) } : {};
   mkdirSync(dirname(hookPath), { recursive: true });
 
-  if (!existsSync(hookPath)) {
+  if (cur === null) {
     writeFileSync(hookPath, `#!/bin/sh\n${blk}\n`);
     chmodSync(hookPath, 0o755);
-    return { path: hookPath, action: "created" };
+    return { path: hookPath, action: "created", ...sharedNote };
   }
 
-  const cur = readFileSync(hookPath, "utf8");
   if (cur.includes(mark)) {
-    const updated = cur.replace(new RegExp(`${escapeRe(mark)}[\\s\\S]*?${escapeRe(end)}`), blk);
-    if (updated === cur) return { path: hookPath, action: "unchanged" };
+    const closed = blockRe.test(cur);
+    let next = blk;
+    let note: Partial<HookInstall> = sharedNote;
+    if (shared?.own) {
+      // A worktree-local re-run may ADD options to the shared block, never
+      // remove them or re-point it: an advisory `hunch init` from a worktree
+      // must not silently downgrade the repo's strict pre-commit guard. So the
+      // block is rebuilt as the UNION of what it carries and what this run asks
+      // for. Refusing the whole write over one omitted option would also discard
+      // the one the run DID ask for — a `hunch private` whose --private never
+      // lands keeps capturing into the public store behind a ✓ line.
+      //
+      // What the block carries is read from ALL its WORKING command lines (the
+      // options of a hand-added second line are merged in — the line itself is
+      // not kept: the block is rebuilt from the template), and the provider line
+      // is an option like any flag: a privacy promise is not a re-run's to withdraw.
+      const carried = builtFlags(own, mark, root);
+      const asked = builtFlags(blk, mark);
+      const keepsLocalOnly = LOCAL_ONLY_RE.test(own);
+      const kept = [...carried.filter((f) => !asked.includes(f)), ...(keepsLocalOnly && !LOCAL_ONLY_RE.test(blk) ? [LOCAL_ONLY_LABEL] : [])];
+      const added = [...asked.filter((f) => !carried.includes(f)), ...(!keepsLocalOnly && LOCAL_ONLY_RE.test(blk) ? [LOCAL_ONLY_LABEL] : [])];
+      const keptNote = { ...sharedNote, ...(kept.length > 0 ? { keptFlags: kept } : {}) };
+      // Nothing to add: the block stays byte-identical. Rebuilding it anyway would
+      // let a re-run that asked for nothing rewrite a line someone shaped by hand
+      // (a `--strict || true` softened guard would come back blocking).
+      if (added.length === 0) return { path: hookPath, action: "kept-shared", ...keptNote };
+      next = build(shared.invocation, GIT_CONTEXT, { flags: carried, localOnly: keepsLocalOnly });
+      note = { ...keptNote, addedFlags: added };
+    }
+    // No closing marker: there is nothing to replace in place, and saying
+    // "unchanged" (or "kept") would hide that this run's block never landed.
+    if (!closed) {
+      return {
+        path: hookPath,
+        action: "unreachable",
+        reason: `the Hunch block in ${basename(hookPath)} has no closing \`${end}\` line, so it cannot be updated in place — replace it with the snippet below`,
+        snippet: next,
+        stale: true,
+        live: true,
+      };
+    }
+    const updated = cur.replace(blockRe, () => next);
+    if (updated === cur) return { path: hookPath, action: "unchanged", ...sharedNote };
     writeFileSync(hookPath, updated);
     chmodSync(hookPath, 0o755);
-    return { path: hookPath, action: "updated" };
+    return { path: hookPath, action: "updated", ...note };
   }
 
   const appended = cur.endsWith("\n") ? `${cur}${blk}\n` : `${cur}\n${blk}\n`;
   writeFileSync(hookPath, appended);
   chmodSync(hookPath, 0o755);
-  return { path: hookPath, action: "appended" };
+  return { path: hookPath, action: "appended", ...sharedNote };
 }
 
 export function installPostCommitHook(root: string, invocation: string, opts: { private?: boolean; commit?: boolean; localOnly?: boolean } = {}): HookInstall {
-  return installManagedBlock(root, "post-commit", MARK, ENDMARK, (inv) => block(inv, opts), invocation);
+  return installManagedBlock(root, "post-commit", MARK, ENDMARK, (inv, _ctx, keep) => block(inv, opts, keep), invocation);
 }
 
 const PRE_MARK = "# >>> hunch pre-commit (constraint guard) >>>";
@@ -578,9 +812,10 @@ const PRE_END = "# <<< hunch pre-commit <<<";
  *  blocking invariant (see strictgate.ts), so it's safe on a shared repo.
  *  Preserves any existing pre-commit hook. */
 export function installPreCommitHook(root: string, invocation: string, strict = false): HookInstall {
-  const build: BlockBuilder = (inv) => {
-    const cmd = `${inv} check --staged${strict ? " --strict" : ""}`;
-    return [PRE_MARK, strict ? cmd : `${cmd} || true`, PRE_END].join("\n");
+  const build: BlockBuilder = (inv, _ctx, keep) => {
+    const on = strict || keep?.flags.includes("--strict");
+    const cmd = `${inv} check --staged${on ? " --strict" : ""}`;
+    return [PRE_MARK, on ? cmd : `${cmd} || true`, PRE_END].join("\n");
   };
   return installManagedBlock(root, "pre-commit", PRE_MARK, PRE_END, build, invocation);
 }
@@ -629,7 +864,7 @@ function repairProvenanceMergeBlock(invocation: string): string {
  *  (the file itself is new) outranks "appended"/"updated" (an existing file
  *  changed), which outrank "unchanged". Non-writing results are handled before
  *  ranking (they must never be masked by a sibling's success). */
-const ACTION_RANK: Record<HookInstall["action"], number> = { created: 3, appended: 2, updated: 2, unchanged: 1, "managed-elsewhere": 0, unreachable: 0 };
+const ACTION_RANK: Record<HookInstall["action"], number> = { created: 3, appended: 2, updated: 2, unchanged: 1, "kept-shared": 1, "managed-elsewhere": 0, unreachable: 0 };
 
 const writes = (h: HookInstall): boolean => h.action !== "managed-elsewhere" && h.action !== "unreachable";
 
@@ -655,7 +890,17 @@ export function installPostMergeHook(root: string, invocation: string): HookInst
   }
   if (!writes(grounding)) return grounding;
   if (!writes(repair)) return repair;
-  return ACTION_RANK[repair.action] >= ACTION_RANK[grounding.action] ? repair : grounding;
+  const picked = ACTION_RANK[repair.action] >= ACTION_RANK[grounding.action] ? repair : grounding;
+  const other = picked === repair ? grounding : repair;
+  // Either half may be the one that kept the repo's shared invocation (issue
+  // #316); the ranking above can pick the other one. Carry the shared-hook facts
+  // over so the CLI line stays true about what the file now runs.
+  return {
+    ...picked,
+    ...(picked.sharedInvocation ?? other.sharedInvocation ? { sharedInvocation: picked.sharedInvocation ?? other.sharedInvocation } : {}),
+    ...(picked.keptFlags ?? other.keptFlags ? { keptFlags: picked.keptFlags ?? other.keptFlags } : {}),
+    ...(picked.droppedFlags ?? other.droppedFlags ? { droppedFlags: picked.droppedFlags ?? other.droppedFlags } : {}),
+  };
 }
 
 /** When two snippets for the same file are joined, drop the second's leading
@@ -777,17 +1022,91 @@ export function hookInvocationLines(report: HookReport, running: string): string
     `${names.join(", ")} → ${inv}${running && inv !== running ? ` (differs from the running Hunch: ${running})` : ""}`);
 }
 
+const KEPT_HOW = " — to change its options, re-run `hunch init` with a Hunch that is not inside a linked worktree (a global install, or the main checkout's)";
+
 /** CLI lines for one install result: the usual ✓ line when the block is in a
  *  file git runs, otherwise a warning with the reason and the snippet to add to
  *  the manager's own file. */
 export function formatHookInstall(root: string, label: string, h: HookInstall, detail = ""): string[] {
-  if (writes(h)) return [`  ✓ ${label} ${h.action}${detail}`];
+  // kept-shared deliberately drops `detail`: it describes the options this run
+  // ASKED for, and a run that asked for FEWER than the shared block carries (an
+  // advisory re-run of a strict guard) would describe a block that is not there
+  // (issue #316).
+  if (h.action === "kept-shared") {
+    const flags = h.keptFlags?.length ? ` with ${h.keptFlags.join(" ")}` : "";
+    // The block kept options this run did not ask for, so the way to remove them
+    // is the one thing worth saying next.
+    const how = h.keptFlags?.length ? KEPT_HOW : "";
+    return [`  ✓ ${label} kept — the shared hook keeps running ${h.sharedInvocation}${flags} (not re-pointed at this worktree)${how}`];
+  }
+  if (writes(h)) {
+    // A union write (issue #316). Once an option was KEPT, `detail` — which
+    // describes only what this run asked for — is no longer the truth about the
+    // block: an "advisory" detail beside a kept --strict contradicts itself.
+    const opts = [h.addedFlags?.length ? `added ${h.addedFlags.join(" ")}` : "", h.keptFlags?.length ? `kept its existing ${h.keptFlags.join(" ")}` : ""].filter(Boolean).join(", ");
+    const union = opts ? ` — ${opts} (a worktree re-run adds options, never removes them)${h.keptFlags?.length ? KEPT_HOW : ""}` : "";
+    const said = h.keptFlags?.length ? "" : detail;
+    const lost = h.droppedFlags?.length ? ` — the previous block's ${h.droppedFlags.join(" ")} was not carried over; re-run with the option to restore it` : "";
+    if (h.sharedInvocation) return [`  ✓ ${label} ${h.action}${said} — runs the repo's shared Hunch (${h.sharedInvocation}), not this worktree's${union}${lost}`];
+    return [`  ✓ ${label} ${h.action}${detail}${lost}`];
+  }
   const shown = isInside(root, h.path) ? relative(realish(root), realish(h.path)).replace(/\\/g, "/") : h.path;
   return [
-    `  ⚠ ${label} NOT installed — ${h.reason ?? "a hook manager owns this hook"}`,
+    `  ⚠ ${label} NOT ${h.live ? "updated" : "installed"} — ${h.reason ?? "a hook manager owns this hook"}`,
     // A stale block is already there and the reason said to replace it; anything
     // else is missing and has to be added.
     `    ${h.stale ? "replace the Hunch block in" : "add this to"} ${shown} yourself:`,
     ...(h.snippet ?? "").split("\n").map((l) => `      ${l}`),
   ];
+}
+
+/** The closing line `hunch init` prints about the SHARED hooks dir (issue #316).
+ *  Setup used to claim "sharing the repo's hooks + memory" unconditionally —
+ *  true of memory, but the hooks dir is genuinely shared, so a block pointing
+ *  inside a linked worktree dies for every checkout when that worktree goes.
+ *
+ *  The verdict is read from what the shared blocks ACTUALLY run, not from this
+ *  run's actions: a second `hunch init` writes nothing yet the hooks are just as
+ *  broken, and the main checkout — which never used to get a note at all — is
+ *  where the user can most easily fix it. `installs` only decides between the
+ *  healthy variants. `[]` when the repo has no linked worktree. Read-only. */
+export function sharedHooksNote(root: string, installs: HookInstall[]): string[] {
+  const { linked, count } = worktreeTops(root);
+  if (linked.length === 0) return [];
+  const d = hooksDir(root);
+  const dir = isAbsolute(d) ? d : join(root, d);
+
+  // A hooks dir is shared when git resolves it inside the COMMON dir, or points
+  // outside this checkout entirely. A relative `core.hooksPath` (husky's
+  // `.husky/_`) resolves per checkout, so it is this worktree's alone.
+  const common = gitCommonDir(root);
+  const top = gitRun(["rev-parse", "--show-toplevel"], root).stdout;
+  const dirShared = (common !== "" && isInside(common, dir)) || (top !== "" && !isInside(top, dir));
+
+  if (dirShared) {
+    const bound: string[] = [];
+    const tops = new Set<string>();
+    for (const [hookName, m] of managedBlocks()) {
+      const info = blockInfo(resolveHookTarget(root, hookName, m), m, root);
+      const at = info.invocation ? worktreeBound(info.invocation, linked) : null;
+      if (!at) continue;
+      tops.add(at);
+      if (!bound.includes(hookName)) bound.push(hookName);
+    }
+    if (bound.length > 0) {
+      const one = bound.length === 1;
+      // Several blocks may be bound to different worktrees; naming the first one
+      // is enough to find the problem, and the plural says there are more.
+      const where = tops.size > 1 ? `linked worktrees (${[...tops][0]})` : `a linked worktree (${[...tops][0]})`;
+      return [`  ⚠ shared hooks dir (${dir}) — ${bound.join(", ")} run${one ? "s" : ""} Hunch from inside ${where}; removing that worktree breaks ${one ? "it" : "them"} for every checkout of this repo — install Hunch globally or in the main checkout, then re-run \`hunch init\` with it to re-point ${one ? "it" : "them"}`];
+    }
+  }
+
+  if (!isLinkedWorktree(root)) return [];
+  const wrote = installs.some((h) => writes(h));
+  if (!dirShared || !wrote) return ["  ✓ linked worktree — sharing the repo's memory"];
+  if (installs.some((h) => h.sharedInvocation)) {
+    return [`  ✓ linked worktree — sharing the repo's memory; the hooks dir is shared by ${count} worktrees (${dir}) and keeps running the repo's Hunch, not this worktree's`];
+  }
+  return [`  ✓ linked worktree — sharing the repo's hooks + memory (hooks dir is shared by ${count} worktrees: ${dir})`];
 }
