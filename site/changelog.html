@@ -107,6 +107,10 @@
 
     <div class="clog">
       <div class="clog-group">
+        <div class="clog-date">Sep 20, 2026</div>
+        <div class="clog-row"><span class="rel-tag">v1.40.0</span><span class="clog-t"><b>Lighter on every prompt</b> — the prompt hook prints the <span class="mono">hunch task verify</span> command inline and the task's start and finish round trips become conditional, the pre-edit hook stops re-sending a grounding block that nothing changed, and the native parsers load on first parse instead of at import, so <span class="mono">hunch --version</span> and every hook start in a fraction of the time; Kubernetes references resolve within a namespace, the grounding tools share one definition of a known path, and an install from a linked worktree keeps the repo's shared git hooks.</span></div>
+      </div>
+      <div class="clog-group">
         <div class="clog-date">Sep 19, 2026</div>
         <div class="clog-row"><span class="rel-tag">v1.39.3</span><span class="clog-t"><b>Keeps what you recorded</b> — reindexing, branch merges and <span class="mono">hunch private migrate</span> keep edges, lifecycle moves and overlay records they used to drop; the grounding tools stop matching the wrong file; stale-lock takeover is serialized and a recycled pid no longer vouches for a dead owner; <span class="mono">hunch task verify</span> settles on the command's own exit and ledger reads stop taking the writer lock; and <span class="mono">hunch doctor</span> reports a git hook whose command is dead instead of calling it installed.</span></div>
       </div>
