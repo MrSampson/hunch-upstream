@@ -84,7 +84,7 @@ import { rankingStatusLine, resolveTaskRankingMode } from "../core/taskRankingMo
 import { diagnoseIssueCorrectionStage, formatCorrectionStageDiagnostic } from "../core/correctionStage.js";
 import { compileVerifiedEvidenceMap, formatVerifiedEvidenceMap } from "../core/evidenceMap.js";
 import { collectCorrectionStageSources } from "../extractors/correctionSources.js";
-import { buildDeliveryEnvelope, DELIVERY_PROFILES, type DeliveryProfile } from "../core/delivery.js";
+import { buildDeliveryEnvelope, deliveryDedupeInput, DELIVERY_PROFILES, type DeliveryProfile } from "../core/delivery.js";
 import { deriveChangeIdentity } from "../core/changeIdentity.js";
 import { deriveChangeProof } from "../core/changeProof.js";
 import { discoverProjectDna, evaluateProjectDnaMatch, type ProjectDnaArtifact } from "../core/projectDna.js";
@@ -4938,22 +4938,23 @@ program
         recentTasks.length ||
         docGround;
       if (!hasContent) return; // no noise on files Hunch hasn't learned yet
+      const supplements = [
+        ...(retired.length ? [{
+          id: "retired-code",
+          kind: "retired-code",
+          priority: 200,
+          text: `⚠ Deliberately RETIRED from this file — do not re-introduce without cause: ${retired.map((r) => `${[...r.symbols, ...r.deps].join(", ")} (${r.decision})`).join("; ")}.`,
+        }] : []),
+        ...(docGround ? [{ id: "doc-grounding", kind: "doc-grounding", priority: 100, text: docGround }] : []),
+        ...recentTasks,
+      ];
       const envelope = buildDeliveryEnvelope(ctx, {
         profile: "builder",
         root,
         symbols: store.recs("symbols"),
         components: store.recs("components"),
         decisionCorpus: store.recs("decisions"),
-        supplements: [
-          ...(retired.length ? [{
-            id: "retired-code",
-            kind: "retired-code",
-            priority: 200,
-            text: `⚠ Deliberately RETIRED from this file — do not re-introduce without cause: ${retired.map((r) => `${[...r.symbols, ...r.deps].join(", ")} (${r.decision})`).join("; ")}.`,
-          }] : []),
-          ...(docGround ? [{ id: "doc-grounding", kind: "doc-grounding", priority: 100, text: docGround }] : []),
-          ...recentTasks,
-        ],
+        supplements,
       });
       const text = envelope.text.trim();
       // Identical grounding already shown this session → one-line delta instead of
@@ -4990,7 +4991,12 @@ program
       // it never saw that grounding, so its dedup is scoped by its own agent
       // identity (hashed — the raw agent_id is never retained in the key).
       const agentKey = evt.agent_id ? `:${reportHash(evt.agent_id).slice(7, 19)}` : "";
-      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}${agentKey}`, text) === "delta") {
+      // Dedup on the envelope's stable IDENTITY projection, never on the
+      // rendered block: serving the full text writes delivery receipts, and the
+      // next call's task ranking reads them back and moves the wording ("today"
+      // → "delivered today"), so hashing the presentation made this grounding
+      // self-invalidating and re-sent the full block for unchanged records.
+      if (injectionMode(evt.session_id, `pre:${target}${reportTaskId ? `:${reportTaskId}` : ""}${agentKey}`, text, deliveryDedupeInput(envelope, supplements)) === "delta") {
         receipts("refreshed");
         emitContext(
           provider,
