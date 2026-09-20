@@ -456,6 +456,10 @@ function findEntry(entries: FieldPathEntry[], path: string): FieldPathEntry | un
   return entries.find((e) => e.path === path);
 }
 
+/** The RFC 1123 DNS label a real Kubernetes namespace name must be -- the
+ *  positive test literalNamespace applies (see there for why). */
+const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
 /** A namespace a reference can be MATCHED on, or null meaning UNKNOWN.
  *  Deliberately narrower than the ManifestNameRef literal/template split that
  *  names get: a name is a resolution KEY (a template's raw text matches
@@ -467,10 +471,51 @@ function findEntry(entries: FieldPathEntry[], path: string): FieldPathEntry | un
  *  spells it via a template and the other spells it out, and two DIFFERENT
  *  template expressions are not evidence of different namespaces either.
  *  Absent (no entry at all) and an explicit empty string are unknown for the
- *  same reason: neither names a namespace this scanner can compare. */
+ *  same reason: neither names a namespace this scanner can compare.
+ *
+ *  The literal-ness test is therefore POSITIVE, not a list of excluded
+ *  spellings: a value counts only when it already looks like the RFC 1123 DNS
+ *  label a real namespace must be. One test then covers every shape the
+ *  scanner cannot resolve, without a special case per spelling -- the scanner
+ *  only tags a value "template" when the template action starts the value, so
+ *  `namespace: app-{{ .Values.env }}` arrives here as a "literal" and would
+ *  otherwise block edges against the very namespace it renders to; likewise
+ *  YAML null spellings (`~`, `Null`), anchors and tags (`&ns prod`,
+ *  `!!str prod`), uppercase, whitespace and empty. Blocking is the damaging
+ *  direction (unknown never blocks an edge), so anything uncomparable is
+ *  unknown.
+ *
+ *  `null` is the one spelling the regex admits but must still be rejected,
+ *  since it is also the bare YAML null word. It is excluded explicitly rather
+ *  than by inspecting quotes: stripQuotes runs in the scanner, so a genuinely
+ *  quoted `namespace: "null"` is indistinguishable here -- and reading it as
+ *  unknown errs in the conservative direction. */
 function literalNamespace(entry: FieldPathEntry | undefined): string | null {
   if (!entry || entry.value.form !== "literal") return null;
-  return entry.value.value.length > 0 ? entry.value.value : null;
+  const value = entry.value.value;
+  if (value === "null" || !DNS_LABEL.test(value)) return null;
+  return value;
+}
+
+/** The namespace named at `path`, reading EVERY entry there rather than the
+ *  first. A Helm `{{- if }} namespace: prod {{- else }} namespace: staging
+ *  {{- end }}` emits both branches as entries on the same path, and taking
+ *  findEntry's first one would read the document as confidently `prod` and
+ *  block every edge to `staging`. Only an unambiguous agreement -- at least
+ *  one entry, all of them the same literal -- is a namespace this scanner can
+ *  compare; disagreement is unknown, like any other unresolved shape. */
+function namespaceAt(entries: FieldPathEntry[], path: string): string | null {
+  let agreed: string | null = null;
+  let seen = false;
+  for (const e of entries) {
+    if (e.path !== path) continue;
+    const ns = literalNamespace(e);
+    if (ns === null) return null;
+    if (seen && ns !== agreed) return null;
+    agreed = ns;
+    seen = true;
+  }
+  return agreed;
 }
 
 /** Namespace compatibility per the product rule: a MISSING (unknown) namespace
@@ -567,10 +612,9 @@ function extractFieldReferences(kind: string, entries: FieldPathEntry[], docName
     // an explicit statement that the target lives somewhere this scanner
     // cannot name, which is the opposite of "same namespace as me". So the
     // sibling's existence is checked before its literal-ness.
-    const sibling = NAMESPACE_SIBLING_PATHS.has(wildcardPath(e.parentPath))
-      ? entries.find((c) => c.parentPath === e.parentPath && c.key === "namespace")
-      : undefined;
-    out.push({ refKind: spec.refKind, name: e.value, namespace: sibling ? literalNamespace(sibling) : docNamespace });
+    const siblingPath = `${e.parentPath}.namespace`;
+    const hasSibling = NAMESPACE_SIBLING_PATHS.has(wildcardPath(e.parentPath)) && entries.some((c) => c.path === siblingPath);
+    out.push({ refKind: spec.refKind, name: e.value, namespace: hasSibling ? namespaceAt(entries, siblingPath) : docNamespace });
   }
   return out;
 }
@@ -669,7 +713,7 @@ function buildDocument(text: string, docStartChar: number, entries: FieldPathEnt
   // Read OUTSIDE the `resource` branch below: a document with no
   // metadata.name still emits references, and those references carry this
   // document's namespace.
-  const namespace = literalNamespace(findEntry(entries, "metadata.namespace"));
+  const namespace = namespaceAt(entries, "metadata.namespace");
 
   const nameEntry = findEntry(entries, "metadata.name");
   const resource: K8sResourceDoc | null = nameEntry

@@ -1122,3 +1122,60 @@ test("an HTTPRoute backendRef whose namespace sibling is templated reads as unkn
   const [doc] = extractK8sManifest(src);
   assert.equal(doc!.references[0]!.namespace, null);
 });
+
+test("a PARTIALLY templated metadata.namespace reads as null (unknown), like a wholly templated one", () => {
+  // The scanner only tags a value "template" when the action STARTS it, so
+  // `app-{{ .Values.env }}` arrives as a literal -- and reading it as one
+  // would block every edge to the `app-prod` it actually renders to.
+  const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: app-{{ .Values.env }}\n`;
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("a YAML null metadata.namespace reads as null (unknown), in either spelling", () => {
+  // `~` and `null` are the same empty value as an absent key. `null` can only
+  // be excluded by name: stripQuotes already ran, so a quoted "null" is
+  // indistinguishable here -- and unknown is the direction that never blocks.
+  for (const spelling of ["null", "Null", "NULL", "~"]) {
+    const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: ${spelling}\n`;
+    const [doc] = extractK8sManifest(src);
+    assert.equal(doc!.resource?.namespace, null, `namespace: ${spelling} must not read as a literal namespace`);
+  }
+});
+
+test("an anchored or tagged metadata.namespace reads as null (unknown), never as the decorated text", () => {
+  // A line-oriented scan sees `&ns prod` / `!!str prod` whole; neither is a
+  // name any other document's namespace can be compared against.
+  for (const decorated of ["&ns prod", "!!str prod"]) {
+    const src = `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-config\n  namespace: ${decorated}\n`;
+    const [doc] = extractK8sManifest(src);
+    assert.equal(doc!.resource?.namespace, null, `namespace: ${decorated} must not read as a literal namespace`);
+  }
+});
+
+test("a document with TWO conflicting metadata.namespace entries reads as null (unknown), not as the first", () => {
+  // The Helm `{{- if }}` / `{{- else }}` shape: both branches are emitted as
+  // entries on the same path, and taking the first would confidently block
+  // every edge to the other branch's namespace.
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`,
+    `metadata:`, `  name: my-config`,
+    `{{- if .Values.isProd }}`, `  namespace: prod`,
+    `{{- else }}`, `  namespace: staging`, `{{- end }}`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, null);
+});
+
+test("a document with two AGREEING metadata.namespace entries reads as that namespace", () => {
+  // Unambiguous agreement is still a namespace this scanner can compare; only
+  // disagreement is unknown.
+  const src = [
+    `apiVersion: v1`, `kind: ConfigMap`,
+    `metadata:`, `  name: my-config`,
+    `{{- if .Values.pinned }}`, `  namespace: prod`,
+    `{{- else }}`, `  namespace: prod`, `{{- end }}`, ``,
+  ].join("\n");
+  const [doc] = extractK8sManifest(src);
+  assert.equal(doc!.resource?.namespace, "prod");
+});
