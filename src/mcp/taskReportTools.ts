@@ -55,7 +55,7 @@ export function boundedTaskReportForHost(report: ReturnType<typeof readTaskRepor
 /** Reuse the MCP server's installation, not a potentially stale global binary.
  * `src/core/` and `src/mcp/` are siblings, so the relative entry URL is the
  * same from either — but each caller passes ITS OWN import.meta. */
-function verificationLauncher(): { argv: string[]; shell: string } {
+function verificationLauncher(): { argv: string[]; shell: string; note: string } {
   return verificationLauncherFor(import.meta.url, (specifier) => import.meta.resolve(specifier));
 }
 /** Re-exported so existing imports keep working; the implementation lives in
@@ -66,7 +66,7 @@ export { verificationLauncherFor };
 export function registerTaskReportTools(server: McpServer, getRoot: () => string, getStore: () => HunchStore): void {
   server.registerTool("hunch_task", {
     title: "Start or finish a task's contribution report",
-    description: "Start once per user task, unless the host's prompt hook already opened the task and printed its verify command — then reuse that task_id and do not start. Pass the task_id to hunch_context. Finish before your final response and include the returned concise contribution card, without asking the user, when the task used Hunch (a hunch_* call on this task_id, a verified check, or an application); where the host's own stop hook closes the task and shows the evidence, an unused task needs no finish. Applications are explicitly agent-reported and must name an exact delivered occurrence and record hash. Completion never implies successful verification. Not for storing decisions or claiming tests passed; use the CLI task verify wrapper for observed command results.",
+    description: "Start once per user task, unless the host's prompt hook already opened the task and printed its verify command — then reuse that task_id and do not start. Pass the task_id to hunch_context. Finish before your final response and include the returned concise contribution card, without asking the user; skip finish only when the prompt hook's own instruction said this host closes the task and the task used no Hunch (no hunch_* call on this task_id, no verified check, no hook context you acted on, nothing to claim), and a task you started with this tool must always be finished. Applications are explicitly agent-reported and must name an exact delivered occurrence and record hash. Completion never implies successful verification. Not for storing decisions or claiming tests passed; use the CLI task verify wrapper for observed command results.",
     inputSchema: {
       action: z.enum(["start", "finish"]), task_id: TaskIdSchema.optional(),
       title: z.string().min(1).max(200).optional(),
@@ -89,7 +89,7 @@ export function registerTaskReportTools(server: McpServer, getRoot: () => string
           task = readTaskReport(root, task_id, reportSourceSnapshot(root).hash).task;
         }
         const launcher = verificationLauncher();
-        return { content: [{ type: "text" as const, text: `Task ${task.task_id} · ${task.state}. Pass task_id to every hunch_context and decision/correction/finding capture call. Before the final response, finish with hunch_task and include its contribution card — unless the host's own stop hook closes the task for you and this task used no Hunch memory. For checks use this exact installation (the global hunch binary may be stale): ${launcher.shell} task verify ${task.task_id} -- <command> [arguments]. The default budget is 15 minutes; add --timeout <seconds> before -- for a longer suite.` }], structuredContent: { task, verification_argv: [...launcher.argv, "task", "verify", task.task_id, "--"] } };
+        return { content: [{ type: "text" as const, text: `Task ${task.task_id} · ${task.state}. Pass task_id to every hunch_context and decision/correction/finding capture call. Before the final response, finish with hunch_task and include its contribution card. For checks use this exact installation (the global hunch binary may be stale): ${launcher.shell} task verify ${task.task_id} -- <command> [arguments]${launcher.note}. The default budget is 15 minutes; add --timeout <seconds> before -- for a longer suite.` }], structuredContent: { task, verification_argv: [...launcher.argv, "task", "verify", task.task_id, "--"] } };
       }
       if (!task_id) throw new Error("finish requires the exact task_id");
       for (const claim of applications ?? []) recordReportClaim(root, task_id, claim);

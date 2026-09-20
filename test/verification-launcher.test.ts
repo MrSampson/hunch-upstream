@@ -46,5 +46,28 @@ test("the inline shell hint is quoted for the running platform and always maps o
     assert.ok(launcher.shell.startsWith("'"), "POSIX quoting starts at the first argument");
     assert.doesNotMatch(launcher.shell, /^&/);
   }
-  assert.equal(launcher.shell.split("'").length - 1, launcher.argv.length * 2, "each argv element is wrapped in one quote pair");
+  // Independently recompute the expected hint from argv rather than counting
+  // quotes, which a path containing an apostrophe would break.
+  const posixQuoted = launcher.argv.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
+  const winQuoted = `& ${launcher.argv.map(a => `'${a.replace(/'/g, "''")}'`).join(" ")}`;
+  assert.equal(launcher.shell, process.platform === "win32" ? winQuoted : posixQuoted, "the hint is exactly argv under this platform's quoting");
+});
+
+test("the Windows hint is PowerShell-quoted and says how to use it in a POSIX shell, and the POSIX hint needs no note", () => {
+  const resolve = () => "file:///tools/tsx/loader.mjs";
+  const meta = new URL("../src/core/verifyLauncher.ts", import.meta.url).href;
+  const win = fromCore(meta, resolve, "win32");
+  assert.ok(win.shell.startsWith("& '"), "PowerShell needs the call operator before a quoted path");
+  // PowerShell escapes a single quote by doubling it, never with a backslash.
+  assert.equal(win.shell, `& ${win.argv.map(a => `'${a.replace(/'/g, "''")}'`).join(" ")}`);
+  assert.doesNotMatch(win.shell, /'\\''/);
+  assert.ok(win.note.length > 0, "the win32 hint must disambiguate PowerShell from Git Bash");
+  assert.match(win.note, /Git Bash/);
+  assert.ok(win.note.includes('drop the leading "& "'), "the note says exactly what to remove");
+  const posix = fromCore(meta, resolve, "linux");
+  assert.ok(posix.shell.startsWith("'"), "POSIX quoting starts at the first argument");
+  assert.doesNotMatch(posix.shell, /^&/);
+  assert.equal(posix.shell, posix.argv.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(" "));
+  assert.equal(posix.note, "", "no note where only one shell form applies");
+  assert.deepEqual(win.argv, posix.argv, "only the hint varies by platform; argv is the same");
 });
