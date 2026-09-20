@@ -207,6 +207,160 @@ test("parseDocAnchors: an indented code block INSIDE a list item is not a fence 
   assert.deepEqual(parseDocAnchors(md), [{ topic: "deep.topic", pin: "dec_ffff000009", line: 4 }]);
 });
 
+test("parseDocAnchors: a line of nothing but list markers stays linear, not quadratic (issue #331)", () => {
+  // The list-marker walk used to re-slice the line and re-scan the remainder
+  // per marker, so a pathological line cost O(L²): a 1 MB line did not finish
+  // in ten minutes. Both shapes are 1 MB of markers and nothing else.
+  for (const line of ["- ".repeat(500_000) + "x", "-" + " -".repeat(500_000) + " x"]) {
+    const started = performance.now();
+    assert.deepEqual(parseDocAnchors(line), []);
+    const ms = performance.now() - started;
+    // Generously above the ~30 ms this takes; the point is minutes → milliseconds.
+    assert.ok(ms < 2000, `1 MB marker line took ${ms.toFixed(0)}ms`);
+  }
+});
+
+test("parseDocAnchors: only a bullet or `1.` with content interrupts a paragraph (issue #331)", () => {
+  // CommonMark: mid-paragraph, an ordered marker opens an item only when it is
+  // numbered 1 — otherwise "2. the second point" is prose, and the fence below
+  // it is measured from column 0, not from a phantom item.
+  const withBlank = [
+    "See the changelog for",
+    "2. the second point",                                    // prose, not an item
+    "",
+    "   ```md",                                               // 3 spaces → a real fence
+    "<!-- hunch:topic ex.topic dec_aaaa000001 -->",           // inside it → inert
+    "   ```",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(withBlank), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 7 }]);
+
+  const tight = [
+    "Paragraph text",
+    "2. something",                                           // prose, not an item
+    "    ```",                                                // 4 spaces from column 0 → not a fence
+    "    <!-- hunch:topic real.topic dec_aaaa000001 -->",     // nothing hides it
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(tight), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 4 }]);
+});
+
+test("parseDocAnchors: a `1.` item and sibling `2.` items still work after a paragraph (issue #331)", () => {
+  const md = [
+    "Steps:",
+    "1. first",                                               // `1.` may interrupt a paragraph
+    "2. second",                                              // a sibling of an OPEN item
+    "",
+    "   ```md",
+    "   <!-- hunch:topic ex.topic dec_ffff000009 -->",
+    "   ```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 9 }]);
+
+  // The same shape with a fence that is ONLY a fence if `10.` opened an item
+  // (4 columns from column 0 would be an indented block): a sibling marker
+  // dedents out of the previous item, so it is a fresh block start and the
+  // paragraph-interruption rule does not apply to it.
+  const wide = [
+    "9. nine",
+    "10. ten",                                                // sibling, numbered ≠ 1
+    "",
+    "    ```md",
+    "    <!-- hunch:topic ex.topic dec_ffff000009 -->",
+    "    ```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(wide), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 8 }]);
+
+  // A bullet list followed straight by an ordered list starting at 10: the
+  // bullet item closes on the dedent, so `10.` starts a list, not prose.
+  const afterBullet = wide.replace("9. nine", "- nine");
+  assert.deepEqual(parseDocAnchors(afterBullet), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 8 }]);
+});
+
+test("parseDocAnchors: a thematic break is ONE repeated char at ≤3 columns (issue #331)", () => {
+  // `- - - * -` mixes break chars: five nested items, the innermost at column
+  // 8, so a fence indented 8 belongs to it. Read as a break, the fence would
+  // be an indented block and its example marker would go live.
+  const mixed = [
+    "- - - * -",
+    "        ```md",
+    "        <!-- hunch:topic ex.topic dec_ffff000009 -->",
+    "        ```",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(mixed), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 6 }]);
+
+  // `    ---` under a paragraph is paragraph text, so the paragraph is still
+  // open on the next line and `2. x` cannot interrupt it.
+  const indented = [
+    "Paragraph text",
+    "    ---",
+    "2. something",                                           // prose, not an item
+    "    ```",                                                // 4 columns from 0 → not a fence
+    "    <!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(indented), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 5 }]);
+});
+
+test("parseDocAnchors: tabs expand to the next tab stop, not a flat 4 columns (issue #331)", () => {
+  // Under a `- a` item (content base 2) a tab is column 4 — inside the item, so
+  // "\t```" is a fence; "  \t```" is ALSO column 4 (the tab advances 2, not 4)
+  // and closes it. A flat-4 expansion put the latter at column 6 and left the
+  // fence open, swallowing the live marker.
+  const md = [
+    "- a",
+    "",
+    "\t```",
+    "\t<!-- hunch:topic ex.topic dec_ffff000009 -->",         // inside the fence → inert
+    "  \t```",                                                // same column → closes it
+    "",
+    "  <!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(md), [{ topic: "real.topic", pin: "dec_aaaa000001", line: 7 }]);
+});
+
+test("parseDocAnchors: a list-item fence ends where the ITEM ends, as rendered (issue #331)", () => {
+  // Pins the deliberate rule in fencedRanges' docblock: a fence hosted in an
+  // item ends at the first non-blank line dedented below the item's content
+  // base. Each expectation below was verified against micromark (CommonMark).
+  const dedentedCloser = [
+    "1. Run:",
+    "   ```sh",
+    "   cmd",
+    "```",                                                    // column 0 → leaves the item, ends that
+    "2. Next",                                                // fence, and OPENS a top-level one
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",         // swallowed to EOF
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(dedentedCloser), []);
+
+  const dedentedContent = [
+    "- Run:",
+    "  ```sh",
+    "cmd",                                                    // column 0 → ends the item's fence
+    "  ```",                                                  // opens a fence that runs to EOF
+    "- Next",
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(dedentedContent), []);
+
+  const markerOutsideItem = [
+    "1. Step:",
+    "",
+    "   ```md",
+    "<!-- hunch:topic ex.topic dec_ffff000009 -->",           // column 0 → outside the item, so LIVE
+    "   ```",                                                 // opens a fence that hides `real`
+    "",
+    "<!-- hunch:topic real.topic dec_aaaa000001 -->",
+  ].join("\n");
+  assert.deepEqual(parseDocAnchors(markerOutsideItem), [{ topic: "ex.topic", pin: "dec_ffff000009", line: 4 }]);
+});
+
 test("parseDocAnchors: markers inside inline code spans are examples too", () => {
   const md = [
     "Anchor a section with `<!-- hunch:topic span.example -->` in the doc.",   // inline span → ignored
