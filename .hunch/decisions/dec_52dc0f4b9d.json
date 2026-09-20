@@ -1,0 +1,96 @@
+{
+  "id": "dec_52dc0f4b9d",
+  "title": "Separate misroute detection from enforcement with staged wiring",
+  "topic": null,
+  "status": "accepted",
+  "context": "Auto-committing MCP write tools from subagents in linked worktrees silently write to the wrong location (primary checkout) because they don't pass cwd hints—a dangerous silent failure with no error signal. Detecting this requires checking if evidence (related_files, affected_files, etc.) exists in a sibling worktree but not at the resolved root. Touches invariant(s): con_e04226bd05 (The MCP server must stay client-agnostic: all assistants point to the same .hunch/ graph; no Claude-only behavior in the server).",
+  "decision": "Implement detection as pure, exported, unit-tested functions (misroutedWorktreeCandidates, guardEvidence) in core libraries. Defer actual refusal/blocking to a follow-up commit that wires detection into the four write tools. Decouples observability from enforcement.",
+  "consequences": [
+    "Detection logic is independently testable before affecting user behavior",
+    "Enables staged rollout: deploy detection and monitor before enforcement blocks writes",
+    "Detection is reusable by other analysis/tools beyond the four write tool integrations",
+    "Requires follow-up commits to complete the fix by actually wiring guards into write tools"
+  ],
+  "alternatives_rejected": [
+    "Implement and enforce blocking in all four write tools in one commit (couples logic to each tool, prevents testing detection independently)",
+    "Add a server-level block before MCP request dispatch (less precise, risks false positives)"
+  ],
+  "rejected_tripwires": [
+    {
+      "alternative": "Implement and enforce blocking in all four write tools in one commit (couples logic to each tool, prevents testing detection independently)",
+      "scope": [
+        "src/core/**",
+        "src/extractors/**",
+        "src/mcp/**",
+        "test/**"
+      ],
+      "forbids": {
+        "deps": [],
+        "symbols": [],
+        "patterns": []
+      },
+      "provenance": {
+        "source": "llm_draft",
+        "confidence": 0.5,
+        "evidence": []
+      }
+    },
+    {
+      "alternative": "Add a server-level block before MCP request dispatch (less precise, risks false positives)",
+      "scope": [
+        "src/core/**",
+        "src/extractors/**",
+        "src/mcp/**",
+        "test/**"
+      ],
+      "forbids": {
+        "deps": [],
+        "symbols": [],
+        "patterns": []
+      },
+      "provenance": {
+        "source": "llm_draft",
+        "confidence": 0.5,
+        "evidence": []
+      }
+    }
+  ],
+  "related_components": [
+    "cmp_a94a8fe5cc",
+    "cmp_b256a6aed0",
+    "cmp_dfa5b5acde",
+    "cmp_e0ccfe26fe",
+    "cmp_f27fede222"
+  ],
+  "related_files": [
+    "src/core/paths.ts",
+    "src/extractors/git.ts",
+    "src/mcp/server.ts",
+    "test/mcp-misroute-guard.test.ts"
+  ],
+  "supersedes": null,
+  "superseded_by": null,
+  "caused_by_bug": null,
+  "commit": "6d93970e",
+  "valid_from": "2026-09-20T14:41:51+02:00",
+  "valid_to": null,
+  "retired": {
+    "symbols": [],
+    "deps": []
+  },
+  "provenance": {
+    "source": "llm_draft+summary",
+    "confidence": 0.5,
+    "evidence": [
+      "commit:6d93970e",
+      "synth:provider=claude-cli",
+      "branch:fix/worktree-misroute-guard",
+      "src/core/paths.ts",
+      "src/extractors/git.ts",
+      "src/mcp/server.ts",
+      "test/mcp-misroute-guard.test.ts"
+    ],
+    "last_verified": "2026-09-20T12:42:16.719Z"
+  },
+  "date": "2026-09-20T14:41:51+02:00"
+}
