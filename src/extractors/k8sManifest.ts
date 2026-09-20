@@ -33,6 +33,12 @@ interface K8sReferenceCandidate {
    *  value (data-dependent, not statically known). */
   refKind: string;
   name: ManifestNameRef;
+  /** The namespace this reference resolves IN, or null for "unknown" (see
+   *  literalNamespace). Kubernetes name references are same-namespace by
+   *  definition, so this defaults to the referring DOCUMENT's own namespace;
+   *  the one shape that can legitimately point elsewhere (a Gateway API
+   *  `backendRefs[].namespace` sibling) overrides it. */
+  namespace: string | null;
 }
 
 type ManifestLabelMap = Record<string, string>;
@@ -40,6 +46,10 @@ type ManifestLabelMap = Record<string, string>;
 interface K8sResourceDoc {
   kind: string;
   name: ManifestNameRef;
+  /** `metadata.namespace` when it is a plain literal, else null = UNKNOWN (see
+   *  literalNamespace). Cluster-scoped kinds need no special case: they simply
+   *  never carry the field, so they are unknown and compatible with anything. */
+  namespace: string | null;
   startChar: number;
   endChar: number;
 }
@@ -446,6 +456,74 @@ function findEntry(entries: FieldPathEntry[], path: string): FieldPathEntry | un
   return entries.find((e) => e.path === path);
 }
 
+/** The RFC 1123 DNS label a real Kubernetes namespace name must be -- the
+ *  positive test literalNamespace applies (see there for why). */
+const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+/** A namespace a reference can be MATCHED on, or null meaning UNKNOWN.
+ *  Deliberately narrower than the ManifestNameRef literal/template split that
+ *  names get: a name is a resolution KEY (a template's raw text matches
+ *  another identical template's raw text, which is real evidence), whereas a
+ *  namespace here is only ever a FILTER, and the product rule is that unknown
+ *  matches anything. So a templated `namespace: {{ .Release.Namespace }}` is
+ *  unknown rather than a `T:`-keyed literal -- two documents whose namespace
+ *  renders identically must not be blocked from linking just because one
+ *  spells it via a template and the other spells it out, and two DIFFERENT
+ *  template expressions are not evidence of different namespaces either.
+ *  Absent (no entry at all) and an explicit empty string are unknown for the
+ *  same reason: neither names a namespace this scanner can compare.
+ *
+ *  The literal-ness test is therefore POSITIVE, not a list of excluded
+ *  spellings: a value counts only when it already looks like the RFC 1123 DNS
+ *  label a real namespace must be. One test then covers every shape the
+ *  scanner cannot resolve, without a special case per spelling -- the scanner
+ *  only tags a value "template" when the template action starts the value, so
+ *  `namespace: app-{{ .Values.env }}` arrives here as a "literal" and would
+ *  otherwise block edges against the very namespace it renders to; likewise
+ *  YAML null spellings (`~`, `Null`), anchors and tags (`&ns prod`,
+ *  `!!str prod`), uppercase, whitespace and empty. Blocking is the damaging
+ *  direction (unknown never blocks an edge), so anything uncomparable is
+ *  unknown.
+ *
+ *  `null` is the one spelling the regex admits but must still be rejected,
+ *  since it is also the bare YAML null word. It is excluded explicitly rather
+ *  than by inspecting quotes: stripQuotes runs in the scanner, so a genuinely
+ *  quoted `namespace: "null"` is indistinguishable here -- and reading it as
+ *  unknown errs in the conservative direction. */
+function literalNamespace(entry: FieldPathEntry | undefined): string | null {
+  if (!entry || entry.value.form !== "literal") return null;
+  const value = entry.value.value;
+  if (value === "null" || !DNS_LABEL.test(value)) return null;
+  return value;
+}
+
+/** The namespace named at `path`, reading EVERY entry there rather than the
+ *  first. A Helm `{{- if }} namespace: prod {{- else }} namespace: staging
+ *  {{- end }}` emits both branches as entries on the same path, and taking
+ *  findEntry's first one would read the document as confidently `prod` and
+ *  block every edge to `staging`. Only an unambiguous agreement -- at least
+ *  one entry, all of them the same literal -- is a namespace this scanner can
+ *  compare; disagreement is unknown, like any other unresolved shape. */
+function namespaceAt(entries: FieldPathEntry[], path: string): string | null {
+  let agreed: string | null = null;
+  let seen = false;
+  for (const e of entries) {
+    if (e.path !== path) continue;
+    const ns = literalNamespace(e);
+    if (ns === null) return null;
+    if (seen && ns !== agreed) return null;
+    agreed = ns;
+    seen = true;
+  }
+  return agreed;
+}
+
+/** Namespace compatibility per the product rule: a MISSING (unknown) namespace
+ *  matches anything; two DIFFERENT literal namespaces block the edge. */
+export function namespacesCompatible(a: string | null, b: string | null): boolean {
+  return a === null || b === null || a === b;
+}
+
 interface FieldPathSpec {
   /** Wildcarded path, e.g. "spec.template.spec.containers[].env[].valueFrom.secretKeyRef.name". */
   path: string;
@@ -511,13 +589,32 @@ function fieldSpecsForKind(kind: string): FieldPathSpec[] {
   return specs;
 }
 
-function extractFieldReferences(kind: string, entries: FieldPathEntry[]): K8sReferenceCandidate[] {
+/** The ONE reference shape in fieldSpecsForKind that Kubernetes lets point at
+ *  another namespace: a Gateway API `backendRefs[]` entry carries an optional
+ *  `namespace` SIBLING of its own `name`. Every other shape here
+ *  (configMapRef/secretRef/volumes/imagePullSecrets/Ingress backend/
+ *  ownerReferences) is same-namespace by API definition and has no namespace
+ *  field at all, so none of them needs an override. Read off the concrete
+ *  (non-wildcarded) entry list by exact parentPath -- the same
+ *  pair-siblings-by-index technique extractOwnerReferenceCandidates uses --
+ *  rather than new parsing machinery. */
+const NAMESPACE_SIBLING_PATHS = new Set(["spec.rules[].backendRefs[]"]);
+
+function extractFieldReferences(kind: string, entries: FieldPathEntry[], docNamespace: string | null): K8sReferenceCandidate[] {
   const specs = fieldSpecsForKind(kind);
   const out: K8sReferenceCandidate[] = [];
   for (const e of entries) {
     const wp = wildcardPath(e.path);
     const spec = specs.find((s) => s.path === wp);
-    if (spec) out.push({ refKind: spec.refKind, name: e.value });
+    if (!spec) continue;
+    // A sibling that EXISTS but isn't a comparable literal (templated, empty)
+    // must read as unknown, NOT fall back to the document's namespace: it is
+    // an explicit statement that the target lives somewhere this scanner
+    // cannot name, which is the opposite of "same namespace as me". So the
+    // sibling's existence is checked before its literal-ness.
+    const siblingPath = `${e.parentPath}.namespace`;
+    const hasSibling = NAMESPACE_SIBLING_PATHS.has(wildcardPath(e.parentPath)) && entries.some((c) => c.path === siblingPath);
+    out.push({ refKind: spec.refKind, name: e.value, namespace: hasSibling ? namespaceAt(entries, siblingPath) : docNamespace });
   }
   return out;
 }
@@ -528,7 +625,7 @@ function extractFieldReferences(kind: string, entries: FieldPathEntry[]): K8sRef
  *  entries never get cross-paired. Not expressible via FieldPathSpec's
  *  single-fixed-refKind model, so it's a dedicated pass over the concrete
  *  (non-wildcarded) entries. */
-function extractOwnerReferenceCandidates(entries: FieldPathEntry[]): K8sReferenceCandidate[] {
+function extractOwnerReferenceCandidates(entries: FieldPathEntry[], docNamespace: string | null): K8sReferenceCandidate[] {
   const byIndex = new Map<string, { name?: FieldPathEntry; kind?: FieldPathEntry }>();
   for (const e of entries) {
     const m = /^metadata\.ownerReferences(\[\d+\])\.(name|kind)$/.exec(e.path);
@@ -540,7 +637,10 @@ function extractOwnerReferenceCandidates(entries: FieldPathEntry[]): K8sReferenc
   const out: K8sReferenceCandidate[] = [];
   for (const { name, kind } of byIndex.values()) {
     if (!name || !kind || kind.value.form !== "literal") continue; // an owner's kind must be a literal to type the reference at all
-    out.push({ refKind: kind.value.value, name: name.value });
+    // An ownerReferences entry has NO namespace field in the API at all -- an
+    // owner is always in the owned object's own namespace (or cluster-scoped),
+    // so the document's namespace is the only correct answer here.
+    out.push({ refKind: kind.value.value, name: name.value, namespace: docNamespace });
   }
   return out;
 }
@@ -608,12 +708,19 @@ function buildDocument(text: string, docStartChar: number, entries: FieldPathEnt
   const kind = kindEntry?.value.form === "literal" ? kindEntry.value.value : null;
   if (!kind || !ALLOWED_KINDS.has(kind)) return { resource: null, references: [], selector: null, labels: null };
 
+  // Found with the same entry machinery as metadata.name, so it inherits the
+  // scanner's quote-stripping, comment-stripping and CRLF tolerance for free.
+  // Read OUTSIDE the `resource` branch below: a document with no
+  // metadata.name still emits references, and those references carry this
+  // document's namespace.
+  const namespace = namespaceAt(entries, "metadata.namespace");
+
   const nameEntry = findEntry(entries, "metadata.name");
   const resource: K8sResourceDoc | null = nameEntry
-    ? { kind, name: nameEntry.value, startChar: docStartChar, endChar: docStartChar + text.length }
+    ? { kind, name: nameEntry.value, namespace, startChar: docStartChar, endChar: docStartChar + text.length }
     : null;
 
-  const references = [...extractFieldReferences(kind, entries), ...extractOwnerReferenceCandidates(entries)];
+  const references = [...extractFieldReferences(kind, entries, namespace), ...extractOwnerReferenceCandidates(entries, namespace)];
   const selector = kind === "Service" ? extractLiteralLabelMap("spec.selector", entries, unresolvedContainers, valuelessKeyParents) : null;
   const labelsPath = LABELS_PATH_BY_KIND[kind];
   const labels = labelsPath ? extractLiteralLabelMap(labelsPath, entries, unresolvedContainers, valuelessKeyParents) : null;

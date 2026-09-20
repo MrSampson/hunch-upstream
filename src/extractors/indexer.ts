@@ -13,7 +13,7 @@ import { dirname, join, posix } from "node:path";
 import type { HunchStore } from "../store/hunchStore.js";
 import { parseSource, attributeCalls, attributeRelations, MAX_BODY_TEXT_CHARS, type ParsedRelation } from "./parse.js";
 import { extractHelmDirectives } from "./helm.js";
-import { extractK8sManifest, type K8sManifestDocument, type ManifestNameRef } from "./k8sManifest.js";
+import { extractK8sManifest, namespacesCompatible, type K8sManifestDocument, type ManifestNameRef } from "./k8sManifest.js";
 import { symbolId, componentId, edgeId, sha1 } from "../core/ids.js";
 import { externalImportNodeId, externalPackage } from "../core/externalImports.js";
 import { resolveRelativeImport } from "../core/relativeImports.js";
@@ -159,10 +159,16 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
   const perFileCalls: Array<{ file: string; bySym: Map<number, Map<string, boolean>> }> = [];
   const perFileImports: Array<{ file: string; imports: string[] }> = [];
   const perFileRelations: Array<{ file: string; bySym: Map<number, ParsedRelation[]> }> = [];
-  const k8sResourceIndex: Array<{ symbolId: string; scope: string; kind: string; nameKey: string }> = [];
-  const k8sReferenceCandidates: Array<{ fromSymbolId: string; scope: string; refKind: string; nameKey: string; reason: string }> = [];
-  const k8sSelectors: Array<{ symbolId: string; scope: string; selector: Record<string, string> }> = [];
-  const k8sWorkloadLabels: Array<{ symbolId: string; scope: string; labels: Record<string, string> }> = [];
+  // `namespace` on all four: a Kubernetes reference only resolves WITHIN a
+  // namespace, so a same-named resource in a different one is a different
+  // resource (issue #297). null means UNKNOWN (absent/templated/empty), which
+  // matches anything -- see namespacesCompatible. All four are in-memory
+  // resolution scratch, never persisted: the edges they produce keep their
+  // existing shape.
+  const k8sResourceIndex: Array<{ symbolId: string; scope: string; kind: string; nameKey: string; namespace: string | null }> = [];
+  const k8sReferenceCandidates: Array<{ fromSymbolId: string; scope: string; refKind: string; nameKey: string; namespace: string | null; reason: string }> = [];
+  const k8sSelectors: Array<{ symbolId: string; scope: string; namespace: string | null; selector: Record<string, string> }> = [];
+  const k8sWorkloadLabels: Array<{ symbolId: string; scope: string; namespace: string | null; labels: Record<string, string> }> = [];
   const phpNamespaces = new Map<string, string | null>();
   const phpUseDeclarations = new Map<string, string[]>();
   // Batched per-file git metrics (churn + last commit) in TWO `git log` spawns
@@ -303,15 +309,16 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
       const fromId = k8sSymbolIdByStartByte.get(doc.resource.startChar);
       if (!fromId) continue;
       const scope = chartRoot ?? rel;
-      k8sResourceIndex.push({ symbolId: fromId, scope, kind: doc.resource.kind, nameKey: nameKeyText(doc.resource.name) });
+      const namespace = doc.resource.namespace;
+      k8sResourceIndex.push({ symbolId: fromId, scope, kind: doc.resource.kind, nameKey: nameKeyText(doc.resource.name), namespace });
       for (const ref of doc.references) {
         k8sReferenceCandidates.push({
-          fromSymbolId: fromId, scope, refKind: ref.refKind, nameKey: nameKeyText(ref.name),
+          fromSymbolId: fromId, scope, refKind: ref.refKind, nameKey: nameKeyText(ref.name), namespace: ref.namespace,
           reason: `${doc.resource.kind}/${displayNameText(doc.resource.name)} references ${ref.refKind}/${displayNameText(ref.name)}`,
         });
       }
-      if (doc.selector) k8sSelectors.push({ symbolId: fromId, scope, selector: doc.selector });
-      if (doc.labels) k8sWorkloadLabels.push({ symbolId: fromId, scope, labels: doc.labels });
+      if (doc.selector) k8sSelectors.push({ symbolId: fromId, scope, namespace, selector: doc.selector });
+      if (doc.labels) k8sWorkloadLabels.push({ symbolId: fromId, scope, namespace, labels: doc.labels });
     }
     fileSymbols.set(rel, idsInFile);
     fileSymbolIndexId.set(rel, symbolIndexId);
@@ -419,15 +426,23 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
   // only, with no concept of Kubernetes kind -- a ConfigMap and a Secret that
   // happen to share a name would incorrectly conflate. Same ambiguity contract
   // as resolveName() though: 0 matches or 2+ matches -> no edge, never guess.
-  const kindNameIndex = new Map<string, string[]>();
+  //
+  // Namespace is a FILTER applied to the candidate list, not part of the key
+  // (issue #297): an unknown namespace on either side must still match, which
+  // a key can't express. Filtering before the uniqueness check -- rather than
+  // after picking a single candidate -- is what makes "ref in a, candidates in
+  // a and b" resolve to a instead of declining as ambiguous, while "ref in a,
+  // candidates in a and unknown" correctly stays ambiguous.
+  const kindNameIndex = new Map<string, typeof k8sResourceIndex>();
   for (const r of k8sResourceIndex) {
     const key = `${r.scope}:${r.kind}:${r.nameKey}`;
-    pushInto(kindNameIndex, key, r.symbolId);
+    pushInto(kindNameIndex, key, r);
   }
   for (const ref of k8sReferenceCandidates) {
-    const candidates = kindNameIndex.get(`${ref.scope}:${ref.refKind}:${ref.nameKey}`) ?? [];
+    const byName = kindNameIndex.get(`${ref.scope}:${ref.refKind}:${ref.nameKey}`) ?? [];
+    const candidates = byName.filter((c) => namespacesCompatible(ref.namespace, c.namespace));
     if (candidates.length !== 1) continue; // 0 or 2+ -> ambiguous or absent, don't guess
-    const toId = candidates[0]!;
+    const toId = candidates[0]!.symbolId;
     if (toId === ref.fromSymbolId) continue;
     addEdge({
       schema: "hunch.edge/1",
@@ -467,6 +482,10 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
         // kinds in LABELS_PATH_BY_KIND, which excludes Service -- so the two
         // ids can never collide today.
         if (svc.symbolId === wl.symbolId) continue;
+        // A Service only ever selects pods in its OWN namespace -- a
+        // label-identical workload next door is a different workload (issue
+        // #297). Unknown on either side still matches, same rule as Phase 1.
+        if (!namespacesCompatible(svc.namespace, wl.namespace)) continue;
         const isSubset = Object.entries(svc.selector).every(([k, v]) => wl.labels[k] === v);
         if (!isSubset) continue;
         addEdge({
