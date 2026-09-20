@@ -37,6 +37,9 @@ import { HunchStore } from "../store/hunchStore.js";
 import { JsonStore } from "../store/jsonStore.js";
 import { selectEmbedder } from "../store/embedder.js";
 import { assertCompleteRepoScan, indexRepo, mergeScannedEdges, scanRepo } from "../extractors/indexer.js";
+// Importing this module is free (the addon load is a function call, not a
+// top-level side effect); only `doctor` below actually calls the loader.
+import { isParserLoadError, loadNativeTreeSitter } from "../extractors/nativeTreeSitter.js";
 import { syncCommit, recordFailure, captureTestRun } from "../synthesis/synthesize.js";
 import { parseTestReport } from "../extractors/testreport.js";
 import {
@@ -1446,6 +1449,18 @@ program
           wstore.reindex(); // committed graph already in the checkout → just build the derived SQLite
           indexNote = `\n  ✓ code graph present in the checkout — blast-radius ready`;
         }
+      } catch (error) {
+        // The code graph is this command's CONVENIENCE; the worktree + branch
+        // are its promise, and git has already created them. A dead native
+        // parser (loaded on first parse, so it surfaces here rather than at
+        // import) used to abort between the two: no success line, the ledger
+        // step skipped, and a re-run then hitting "path already exists" with no
+        // way forward. Downgrade it to the same note channel the other optional
+        // steps use — the worktree stands, the user is told the index was
+        // skipped and why, and `hunch index` there fixes it once TMPDIR/the
+        // install is sound. Anything else is still a real failure of this step.
+        if (!isParserLoadError(error)) throw error;
+        indexNote = `\n  · code graph skipped — ${(error as Error).message}\n    (the worktree is ready; run \`hunch index\` there once the parser loads)`;
       } finally {
         wstore.close();
         openStore = null;
@@ -6747,6 +6762,19 @@ program
     for (const line of synthesisStatusLines(resolution, process.env)) console.log(line);
     const ctxWarning = await maybeWarnOllamaContext(provider.name, process.env);
     if (ctxWarning) console.log(ctxWarning);
+    // The native addons load on first PARSE, not at import, so no other command
+    // that merely starts up proves the parser works. Doctor is the one place
+    // that should pay the ~1.5s load: without this line a broken parser (an
+    // unwritable TMPDIR, a missing or wrong-arch prebuild, an addon preloaded
+    // past the isolation guard) is invisible until an index run refuses.
+    try {
+      loadNativeTreeSitter();
+      console.log(`parser:     native tree-sitter addons load`);
+    } catch (e) {
+      console.log(`parser:     ⛔ ${(e as Error).message}`);
+      console.log(dim(`            no file can be parsed — \`hunch index\` refuses rather than emptying the graph`));
+      process.exitCode = 1;
+    }
     const c = store.reindex().counts;
     console.log(`hunch:      ${c.symbols} symbols, ${c.edges} edges, ${c.components} components, ${c.decisions} decisions, ${c.bugs} bugs, ${c.constraints} constraints`);
     try {

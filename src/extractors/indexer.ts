@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import type { HunchStore } from "../store/hunchStore.js";
 import { parseSource, attributeCalls, attributeRelations, MAX_BODY_TEXT_CHARS, type ParsedRelation } from "./parse.js";
+import { isParserLoadError } from "./nativeTreeSitter.js";
 import { extractHelmDirectives } from "./helm.js";
 import { extractK8sManifest, namespacesCompatible, type K8sManifestDocument, type ManifestNameRef } from "./k8sManifest.js";
 import { symbolId, componentId, edgeId, sha1 } from "../core/ids.js";
@@ -207,7 +208,15 @@ export function scanRepo(store: HunchStore, root: string, opts: ScanRepoOptions 
     let parsed;
     try {
       parsed = parseSource(rel, src);
-    } catch {
+    } catch (error) {
+      // …but a dead PARSER is not a bad file. The native addons load on first
+      // parse, so a broken load (unwritable TMPDIR, missing prebuild, an addon
+      // preloaded past the isolation guard) surfaces here and would mark every
+      // file parse_failed, after which indexRepo replaces symbols/edges/
+      // components with empty arrays and exits 0 — the whole graph silently
+      // wiped. Rethrow so the scan dies before its first store write, the way
+      // the import-time load did.
+      if (isParserLoadError(error)) throw error;
       skipped++;
       issues.push({ path: rel, code: "parse_failed", detail: `${rel} could not be parsed` });
       noteSkip(rel, "parse_failed");
