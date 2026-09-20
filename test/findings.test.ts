@@ -95,6 +95,20 @@ test("liveFindingsFor rewrites an absolute target to repo-relative and never suf
   cleanup();
 });
 
+test("liveFindingsFor: a REAL working-tree file the index cannot see must not suffix-leak a nested same-basename file's findings (issue #334)", () => {
+  const { store, root, cleanup } = tempStore();
+  // A comment-only root file: zero tree-sitter symbols and no covering component,
+  // so graph data alone calls it unreal and the suffix tier would serve
+  // a/empty.ts's finding. The working tree is the last-resort answer.
+  mkdirSync(join(root, "a"), { recursive: true });
+  writeFileSync(join(root, "empty.ts"), "// only a comment — no symbols at all\n");
+  writeFileSync(join(root, "a", "empty.ts"), "export function nestedEmpty(){ return 1; }\n");
+  store.json.put("findings", finding({ title: "the nested file's own gap", affected_files: ["a/empty.ts"] }));
+  assert.deepEqual(store.liveFindingsFor("empty.ts").map((f) => f.title), [], "the real root file inherits nothing");
+  assert.deepEqual(store.liveFindingsFor("a/empty.ts").map((f) => f.title), ["the nested file's own gap"], "the nested file still answers for itself");
+  cleanup();
+});
+
 test("assembleContext carries live findings and formatContext renders them (pre-edit grounding)", () => {
   const { store, cleanup } = tempStore();
   store.json.put("findings", finding({

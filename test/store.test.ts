@@ -167,6 +167,30 @@ test("why() matches an existing full path exactly, never a same-basename suffix 
   cleanup();
 });
 
+test("why() does not suffix-leak onto a REAL working-tree file the index cannot see — zero symbols, no covering component (issue #334)", () => {
+  const { store, root, cleanup } = seed();
+  // The gap left by #299: "is this a real path" was answered from graph data
+  // alone, so a real comment-only root file (no tree-sitter symbols, no
+  // component glob covering it) looked unreal and fell to the suffix tier,
+  // serving a/empty.ts's records. The working tree is the last-resort answer.
+  mkdirSync(join(root, "a"), { recursive: true });
+  writeFileSync(join(root, "empty.ts"), "// only a comment — no symbols at all\n");
+  writeFileSync(join(root, "a", "empty.ts"), "export function nestedEmpty(){ return 1; }\n");
+  store.json.put("symbols", mkSymbol("sym_nested_empty", "a/empty.ts", "nestedEmpty") as never);
+  store.json.put("constraints", { id: "con_nested_empty", type: "correctness", statement: "nested rule", scope: ["a/empty.ts"], severity: "blocking", enforcement: "advisory_v1", rationale: "x", source_decision: null, violations: [], provenance: prov(0.9) } as never);
+  store.reindex();
+
+  const wRoot = store.why("empty.ts");
+  assert.deepEqual(wRoot.symbols.map((s) => s.id), [], "a real root file with no symbols must return none, not a/empty.ts's");
+  assert.deepEqual(wRoot.constraints.map((c) => c.id), [], "and must not inherit the nested-scoped constraint");
+  // The nested file still answers for itself.
+  assert.deepEqual(store.why("a/empty.ts").symbols.map((s) => s.id), ["sym_nested_empty"]);
+  // A DIRECTORY target keeps behaving exactly as it does on origin/main: it is
+  // not a file, so the suffix tier is still available to it.
+  assert.deepEqual(store.why("a").symbols.map((s) => s.id), [], "a bare directory name matches no symbol file, as before");
+  cleanup();
+});
+
 test("replaceAll writes new records BEFORE deleting stale ones — a mid-operation failure never empties the kind (issue #30)", () => {
   const { store, root, cleanup } = seed();
   store.json.put("decisions", { id: "dec_keeper", title: "keeper", status: "accepted", context: "", decision: "", consequences: [], alternatives_rejected: [], related_components: [], related_files: [], supersedes: null, caused_by_bug: null, commit: null, provenance: prov(0.9), date: "2026-06-01T00:00:00Z" } as never);

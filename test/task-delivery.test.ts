@@ -101,3 +101,23 @@ test("tasksFor rewrites an absolute target to repo-relative and never suffix-lea
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("tasksFor: a REAL working-tree file the index cannot see must not suffix-leak a nested same-basename file's tasks (issue #334)", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunch-task-delivery-real-"));
+  const store = new HunchStore(hunchPaths(root));
+  store.json.ensureDirs();
+  try {
+    // A comment-only root file: zero tree-sitter symbols and no covering component,
+    // so graph data alone calls it unreal and the suffix tier would serve
+    // a/empty.ts's task. The working tree is the last-resort answer.
+    mkdirSync(join(root, "a"), { recursive: true });
+    writeFileSync(join(root, "empty.ts"), "// only a comment — no symbols at all\n");
+    writeFileSync(join(root, "a", "empty.ts"), "export function nestedEmpty(){ return 1; }\n");
+    store.json.put("tasks", taskRecord({ id: "htask_000000000000000000000012", finished_at: "2026-09-16T00:00:00.000Z", files: ["a/empty.ts"] }));
+    assert.deepEqual(store.tasksFor("empty.ts").map((r) => r.id), [], "the real root file inherits nothing");
+    assert.deepEqual(store.tasksFor("a/empty.ts").map((r) => r.id), ["htask_000000000000000000000012"], "the nested file still answers for itself");
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});

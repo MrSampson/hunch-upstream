@@ -1,7 +1,7 @@
 /** Filesystem layout for the Hunch (DESIGN.md §6 folder structure). */
 import { join } from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export const HUNCH_DIR = ".hunch";
 
@@ -55,6 +55,41 @@ export function repoRelativeTarget(target: string, root: string): string {
   const rel = toPosixTarget(relative(realpathNorm(toPosixTarget(root)), realpathNorm(t)));
   if (!rel || rel === ".." || rel.startsWith("../") || isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) return t;
   return rel;
+}
+
+/** True when `target` (already repo-relative POSIX form) names a regular FILE
+ *  that really exists inside `root`. The LAST-RESORT half of the "is this a real
+ *  path" question: `isIndexedPath` answers it from graph data alone, but a real
+ *  working-tree file with zero tree-sitter symbols and no covering component
+ *  glob is invisible to it, so it fell through to the suffix tier and leaked an
+ *  unrelated same-basename file's records (issue #334). Callers consult the
+ *  index FIRST and only fall back here, so a deleted-but-still-indexed path and
+ *  a time-travel (`asOf`) query keep answering exactly as before.
+ *
+ *  Deliberately narrow: an absolute path (or a Windows drive letter) and any
+ *  target escaping `root` via ".." are rejected rather than resolved — the
+ *  caller has already run `repoRelativeTarget`, so anything still absolute is
+ *  outside the repo. A DIRECTORY is false: directory targets must keep flowing
+ *  to `structure()`'s dir tier. Any fs error (missing, EACCES, ...) → false.
+ *
+ *  Containment is checked twice: lexically, then again on the REALPATHS. `statSync`
+ *  follows symlinks, so an in-repo `link -> /outside` would otherwise make
+ *  `isRepoFile(root, "link/secret.ts")` true and turn this into a one-bit existence
+ *  oracle for paths outside the repo. A symlinked file pointing at another file
+ *  INSIDE the repo stays true. */
+export function isRepoFile(root: string, target: string): boolean {
+  const t = toPosixTarget(target);
+  if (!t || isAbsolute(t) || /^[a-zA-Z]:/.test(t)) return false;
+  const abs = resolve(root, t);
+  const rel = relative(resolve(root), abs);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
+  try {
+    if (!statSync(abs).isFile()) return false;
+    const realRel = relative(realpathNorm(resolve(root)), realpathSync.native(abs));
+    return !!realRel && realRel !== ".." && !realRel.startsWith(`..${sep}`) && !isAbsolute(realRel);
+  } catch {
+    return false;
+  }
 }
 
 export interface HunchPaths {
