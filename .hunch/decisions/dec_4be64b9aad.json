@@ -1,0 +1,104 @@
+{
+  "id": "dec_4be64b9aad",
+  "title": "Make worktree-guard coverage exhaustive via typed facet mapping",
+  "topic": null,
+  "status": "accepted",
+  "context": "Subagents can write file evidence to the wrong worktree checkout, silently scoping records against the wrong root. Detection existed but was not enforced. Adding new state facets could escape guard coverage without being noticed. Touches invariant(s): con_e04226bd05 (The MCP server must stay client-agnostic: all assistants point to the same .hunch/ graph; no Claude-only behavior in the server).",
+  "decision": "FILE_EVIDENCE_FIELD is a TOTAL type-keyed map over every StateFacet, not an open-ended conditional. Each facet must explicitly declare which file-evidence field it carries (related_files, affected_files, scope, or null). Omitting a new facet is a compile error, not a silent gap.",
+  "consequences": [
+    "Type system prevents accidental unguarded facets when STATE_FACETS grows",
+    "Each tool's guard call is explicit and locally readable",
+    "nuryel_write gets a longer refusal message because its scope is partition-tied to the current root, requiring both cwd and scope to be retried",
+    "Tests verify all four write tools (decision/correction/finding/nuryel) refuse misrouted file evidence"
+  ],
+  "alternatives_rejected": [
+    "Open-ended guard conditionals that skip facets not yet added",
+    "Implicit coverage assumption without a mapping",
+    "Selective guarding of only some tools or facets"
+  ],
+  "rejected_tripwires": [
+    {
+      "alternative": "Open-ended guard conditionals that skip facets not yet added",
+      "scope": [
+        "src/mcp/**",
+        "test/**"
+      ],
+      "forbids": {
+        "deps": [],
+        "symbols": [],
+        "patterns": []
+      },
+      "provenance": {
+        "source": "llm_draft",
+        "confidence": 0.5,
+        "evidence": []
+      }
+    },
+    {
+      "alternative": "Implicit coverage assumption without a mapping",
+      "scope": [
+        "src/mcp/**",
+        "test/**"
+      ],
+      "forbids": {
+        "deps": [],
+        "symbols": [],
+        "patterns": []
+      },
+      "provenance": {
+        "source": "llm_draft",
+        "confidence": 0.5,
+        "evidence": []
+      }
+    },
+    {
+      "alternative": "Selective guarding of only some tools or facets",
+      "scope": [
+        "src/mcp/**",
+        "test/**"
+      ],
+      "forbids": {
+        "deps": [],
+        "symbols": [],
+        "patterns": []
+      },
+      "provenance": {
+        "source": "llm_draft",
+        "confidence": 0.5,
+        "evidence": []
+      }
+    }
+  ],
+  "related_components": [
+    "cmp_a94a8fe5cc",
+    "cmp_dfa5b5acde",
+    "cmp_f27fede222"
+  ],
+  "related_files": [
+    "src/mcp/server.ts",
+    "test/mcp-misroute-guard-wiring.test.ts"
+  ],
+  "supersedes": null,
+  "superseded_by": null,
+  "caused_by_bug": null,
+  "commit": "97255f15",
+  "valid_from": "2026-09-20T14:43:46+02:00",
+  "valid_to": null,
+  "retired": {
+    "symbols": [],
+    "deps": []
+  },
+  "provenance": {
+    "source": "llm_draft",
+    "confidence": 0.65,
+    "evidence": [
+      "commit:97255f15",
+      "synth:provider=claude-cli",
+      "branch:fix/worktree-misroute-guard",
+      "src/mcp/server.ts",
+      "test/mcp-misroute-guard-wiring.test.ts"
+    ],
+    "last_verified": "2026-09-20T12:44:04.361Z"
+  },
+  "date": "2026-09-20T14:43:46+02:00"
+}
