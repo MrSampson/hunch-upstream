@@ -2206,6 +2206,8 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
     },
     async ({ decision, capture_token, task_id }): Promise<ToolResult> => {
       try {
+        const misroute = misrouteGuard(root, `"${decision.title.slice(0, 60)}"`, guardEvidence(root, decision.related_files ?? []));
+        if (misroute) return misroute;
         // Commit-keyed on the CANONICAL full sha (resolved via git rev-parse), so a
         // human passing the short sha they see in `commit` produces the SAME id as
         // the auto-sync path (which keys on the full sha) — UPGRADING the auto-draft
@@ -2448,6 +2450,19 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
     async (input): Promise<ToolResult> => {
       try {
         if (!input.rule || !input.rule.trim()) return invalid("rule is required — state the invariant in plain words.");
+        // Same misroute guard as hunch_record_decision: a scope_hint_file that exists in a
+        // sibling linked worktree but not here is very likely a subagent that forgot cwd,
+        // about to silently scope-and-commit a constraint against the wrong checkout.
+        // Passed through guardEvidence — misroutedWorktreeCandidates understands absolute
+        // paths itself (see its doc comment). The constraint's own scope glob below is a
+        // DIFFERENT job, still relativized against root by buildCorrectionConstraint
+        // internally — a sibling worktree's file evidence never reaches that path.
+        const correctionMisroute = misrouteGuard(
+          root,
+          `correction "${input.rule.slice(0, 60)}"`,
+          input.scope_hint_file ? guardEvidence(root, [input.scope_hint_file]) : [],
+        );
+        if (correctionMisroute) return correctionMisroute;
         // root: relativizes an ABSOLUTE scope_hint_file. Agents naturally send absolute
         // paths (edit-tool payloads and MCP roots are absolute) and every consumer matches
         // repo-relative — without this the rule would be blocking-but-inert and would leak
@@ -2546,6 +2561,9 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
       try {
         if (!finding.title.trim()) return invalid("title is required.");
         if (!finding.observation.trim()) return invalid("observation is required — state what you saw.");
+        // Same misroute guard as hunch_record_decision.
+        const findingMisroute = misrouteGuard(root, `finding "${finding.title.slice(0, 60)}"`, guardEvidence(root, finding.affected_files ?? []));
+        if (findingMisroute) return findingMisroute;
         const id = findingId(finding.title);
         const home = store.captureHome(!!finding.private);
         const existing = home === "private" ? store.getPrivateRec("findings", id) : store.json.get("findings", id);
@@ -2695,6 +2713,18 @@ export function buildServerWithRootControl(initialRoot: string, options: RootCon
     },
     async ({ cwd: _cwd, ...input }): Promise<ToolResult> => {
       try {
+        // Same misroute guard as hunch_record_decision/_correction/_finding. Unlike those
+        // three, nuryel_write's `scope`/`principal.grants` are a repository partition tied
+        // to the CURRENT root: retrying with only `cwd` moved re-homes the store but leaves
+        // the request scoped to the old root's partition, which fails loudly (not silently)
+        // on the retry — misrouteGuard's `extra` spells out the additional step.
+        const misroute = misrouteGuard(
+          root,
+          nuryelWriteSubject(input.facet, input.record),
+          guardEvidence(root, fileEvidenceFor(input.facet, input.record)),
+          "Also move `scope` (and `principal.grants`) to the repository partition for that worktree — nuryel_write's scope does not follow `cwd` automatically.",
+        );
+        if (misroute) return misroute;
         // Same cross-process lock `hunch serve` takes: a second agent writing over stdio must
         // not race the HTTP server between the ledger read and the record write.
         const { hunchDir } = stateHomeFor(store, input.scope);
