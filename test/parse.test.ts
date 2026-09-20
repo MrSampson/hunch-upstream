@@ -31,6 +31,10 @@ test("parseSource extracts symbols, imports, calls", () => {
 });
 
 test("native tree-sitter addons load only from per-process temp copies", () => {
+  // Load them here rather than relying on an earlier test having parsed: the
+  // addons arrive on FIRST PARSE, so run alone this case would otherwise find
+  // an empty require cache and fail for the wrong reason.
+  assert.equal(parseSource("isolation-probe.ts", "export const probe: number = 1")?.parseable, true);
   const require = createRequire(import.meta.url);
   const bindings = Object.keys(require.cache)
     .filter((path) => /(?:tree-sitter(?:-typescript|-python|-yaml)?)\.node$/.test(path))
