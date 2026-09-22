@@ -30,7 +30,8 @@ function repo(prefix = "hunch-misroute-wire-"): string {
   writeFileSync(join(root, "app.ts"), "export const value = 1;\n");
   git(root, "add", "-A");
   git(root, "commit", "-qm", "fixture");
-  return root;
+  // Match the slash spelling emitted by Git's worktree porcelain on Windows.
+  return process.platform === "win32" ? root.replace(/\\/g, "/") : root;
 }
 
 function repoWithWorktree(): { root: string; worktree: string; cleanup: () => void } {

@@ -15,7 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileEvidenceFor, FILE_EVIDENCE_FIELD, guardEvidence, misroutedWorktreeCandidates } from "../src/mcp/server.js";
@@ -38,7 +38,8 @@ function repo(prefix = "hunch-misroute-"): string {
   writeFileSync(join(root, "app.ts"), "export const value = 1;\n");
   git(root, "add", "-A");
   git(root, "commit", "-qm", "fixture");
-  return root;
+  // Git's worktree porcelain uses forward slashes on Windows too.
+  return process.platform === "win32" ? root.replace(/\\/g, "/") : root;
 }
 
 function repoWithWorktree(): { root: string; worktree: string; cleanup: () => void } {
@@ -103,7 +104,8 @@ test("flags the sibling worktree via an absolute path (naive join() would compar
 
 test("a nested worktree under root is not swallowed by root's own lexical containment", () => {
   const root = repo("hunch-misroute-nested-");
-  const nested = join(root, ".worktrees", "feature");
+  const nestedPath = join(root, ".worktrees", "feature");
+  const nested = process.platform === "win32" ? nestedPath.replace(/\\/g, "/") : nestedPath;
   try {
     git(root, "worktree", "add", "-q", "-b", "feature-nested", nested);
     const abs = join(nested, "nested-only.ts");
@@ -154,7 +156,7 @@ test("a legitimate delete/rename at the resolved root is not read as a misroute 
 // guardEvidence keeps the raw string whenever the filesystem or git history
 // confirms it names something real.
 
-test("guardEvidence keeps a real on-disk backslash-byte filename raw, avoiding a false collision", () => {
+test("guardEvidence keeps a real on-disk backslash-byte filename raw, avoiding a false collision", { skip: process.platform === "win32" && "Windows cannot create a literal backslash in a filename" }, () => {
   const fixture = repoWithWorktree();
   try {
     const weird = "weird\\name.ts"; // one real file, literal backslash in the name
@@ -180,7 +182,7 @@ test("guardEvidence keeps a real on-disk backslash-byte filename raw, avoiding a
   }
 });
 
-test("guardEvidence keeps a since-deleted backslash-byte filename raw via history, avoiding a false collision", () => {
+test("guardEvidence keeps a since-deleted backslash-byte filename raw via history, avoiding a false collision", { skip: process.platform === "win32" && "Windows cannot create a literal backslash in a filename" }, () => {
   const fixture = repoWithWorktree();
   try {
     const weird = "weird\\name.ts";
@@ -240,11 +242,20 @@ test(
       // (so the symlink's own lexical parent is root, but its TARGET's parent is
       // the worktree) plus a ".." that pops back out of it.
       mkdirSync(join(fixture.worktree, "sub"));
-      symlinkSync(join(fixture.worktree, "sub"), join(fixture.root, "link"));
+      symlinkSync(join(fixture.worktree, "sub"), join(fixture.root, "link"), "dir");
       // Built by string concatenation, NOT path.join()/path.resolve(): either would
       // lexically collapse the ".." itself before the code under test ever sees it,
       // defeating the very case this test exists to exercise.
       const f = `${fixture.root}/link/../secret.ts`;
+
+      if (process.platform === "win32") {
+        // Win32 normalizes dot segments before traversing the symlink. Prove
+        // the actual filesystem result rather than imposing POSIX semantics.
+        assert.throws(() => readFileSync(f), { code: "ENOENT" });
+        assert.deepEqual(misroutedWorktreeCandidates(fixture.root, [f]), []);
+        return;
+      }
+      assert.equal(readFileSync(f, "utf8"), "export const secret = 1;\n");
 
       // The kernel cancels ".." against the symlink TARGET's parent (the
       // worktree), landing on a real file — never on <root>/secret.ts, which
